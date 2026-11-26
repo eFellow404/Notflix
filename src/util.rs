@@ -204,9 +204,6 @@ pub fn run_command_with_timeout(
     });
 
     let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let mut wait_err: Option<String> = None;
-
     let code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.code().unwrap_or(-1),
@@ -215,8 +212,15 @@ pub fn run_command_with_timeout(
                 if now >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    timed_out = true;
-                    break -1;
+                    // Return immediately without joining pipe reader threads: grandchild
+                    // processes (e.g. `git-remote-http`) may still hold inherited pipe FDs.
+                    return CommandOutcome {
+                        code: -1,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                        timed_out: true,
+                        spawn_error: None,
+                    };
                 }
                 let remaining = deadline.saturating_duration_since(now);
                 std::thread::sleep(remaining.min(Duration::from_millis(20)));
@@ -224,8 +228,13 @@ pub fn run_command_with_timeout(
             Err(err) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                wait_err = Some(err.to_string());
-                break -1;
+                return CommandOutcome {
+                    code: -1,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    timed_out: false,
+                    spawn_error: Some(err.to_string()),
+                };
             }
         }
     };
@@ -241,8 +250,8 @@ pub fn run_command_with_timeout(
         code,
         stdout,
         stderr,
-        timed_out,
-        spawn_error: wait_err,
+        timed_out: false,
+        spawn_error: None,
     }
 }
 

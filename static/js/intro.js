@@ -40,7 +40,7 @@ export function updateSkipIntroVisibility() {
   const cur = byId("videoPlayer").currentTime;
   const inIntro =
     Number.isFinite(cur) &&
-    cur >= ep.intro_start_sec - 0.4 &&
+    cur >= ep.intro_start_sec &&
     cur < ep.intro_end_sec - 0.5;
 
   if (inIntro) {
@@ -112,9 +112,12 @@ export async function extractVisualFingerprint(episode, isCancelled) {
     vid.preload = "auto";
     vid.crossOrigin = "anonymous";
 
+    const GRID_W = 6;
+    const GRID_H = 4;
+    const VEC_LEN = GRID_W * GRID_H * 3;
     const canvas = document.createElement("canvas");
-    canvas.width = 4;
-    canvas.height = 3;
+    canvas.width = GRID_W;
+    canvas.height = GRID_H;
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
     let finished = false;
@@ -146,12 +149,16 @@ export async function extractVisualFingerprint(episode, isCancelled) {
 
       const duration = vid.duration;
       const scanLimit = Math.min(duration - 0.5, 360);
-      const step = 1.5;
+      const step = 1.0;
       const vectors = [];
       const flatFlags = [];
 
       const seekTo = (t) =>
         new Promise((res) => {
+          if (Math.abs(vid.currentTime - t) < 0.02 && vid.readyState >= 2) {
+            res(true);
+            return;
+          }
           let done = false;
           const timer = setTimeout(() => {
             if (!done) {
@@ -176,6 +183,14 @@ export async function extractVisualFingerprint(episode, isCancelled) {
           }
         });
 
+      const vw = vid.videoWidth || 0;
+      const vh = vid.videoHeight || 0;
+      // Crop outer 12% margin so DVD letterbox/pillarbox black bars never bias frame similarity
+      const cropX = vw > 0 ? Math.round(vw * 0.12) : 0;
+      const cropY = vh > 0 ? Math.round(vh * 0.12) : 0;
+      const cropW = vw > 0 ? Math.max(1, vw - cropX * 2) : 0;
+      const cropH = vh > 0 ? Math.max(1, vh - cropY * 2) : 0;
+
       for (let t = 0; t < scanLimit; t += step) {
         if (isCancelled()) {
           cleanup(null);
@@ -183,13 +198,17 @@ export async function extractVisualFingerprint(episode, isCancelled) {
         }
         const ok = await seekTo(t);
         if (!ok || !ctx) {
-          vectors.push(new Array(36).fill(0));
+          vectors.push(new Array(VEC_LEN).fill(0));
           flatFlags.push(true);
           continue;
         }
         try {
-          ctx.drawImage(vid, 0, 0, 4, 3);
-          const pixels = ctx.getImageData(0, 0, 4, 3).data;
+          if (cropW > 0 && cropH > 0) {
+            ctx.drawImage(vid, cropX, cropY, cropW, cropH, 0, 0, GRID_W, GRID_H);
+          } else {
+            ctx.drawImage(vid, 0, 0, GRID_W, GRID_H);
+          }
+          const pixels = ctx.getImageData(0, 0, GRID_W, GRID_H).data;
           const vec = [];
           let sum = 0;
           for (let p = 0; p < pixels.length; p += 4) {
@@ -208,7 +227,7 @@ export async function extractVisualFingerprint(episode, isCancelled) {
           vectors.push(vec);
           flatFlags.push(Math.sqrt(varSum / vec.length) < 8.0);
         } catch {
-          vectors.push(new Array(36).fill(0));
+          vectors.push(new Array(VEC_LEN).fill(0));
           flatFlags.push(true);
         }
       }

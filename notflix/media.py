@@ -36,9 +36,8 @@ def detect_ffmpeg() -> bool:
 
 
 def guess_video_mime(file_path: Path) -> str:
-    ext = file_path.suffix.lower()
-    if ext in VIDEO_MIME_TYPES:
-        return VIDEO_MIME_TYPES[ext]
+    if mime := VIDEO_MIME_TYPES.get(file_path.suffix.lower()):
+        return mime
     guessed, _ = mimetypes.guess_type(str(file_path))
     return guessed or "application/octet-stream"
 
@@ -60,7 +59,6 @@ def parse_range_header(range_header: str, file_size: int) -> Optional[tuple[int,
     start_str, end_str = match.group(1), match.group(2)
     if not start_str and not end_str:
         raise ValueError("Empty byte range")
-
     if file_size <= 0:
         raise ValueError("Cannot satisfy byte range for empty file")
 
@@ -69,18 +67,14 @@ def parse_range_header(range_header: str, file_size: int) -> Optional[tuple[int,
         suffix = int(end_str)
         if suffix <= 0:
             raise ValueError("Invalid suffix byte range")
-        start = max(0, file_size - suffix)
-        end = file_size - 1
-    else:
-        start = int(start_str)
-        end = int(end_str) if end_str else file_size - 1
-        if start >= file_size:
-            raise ValueError("Range start past end of file")
-        if end >= file_size:
-            end = file_size - 1
-        if end < start:
-            raise ValueError("Range end before start")
+        return max(0, file_size - suffix), file_size - 1
 
+    start = int(start_str)
+    if start >= file_size:
+        raise ValueError("Range start past end of file")
+    end = min(int(end_str), file_size - 1) if end_str else file_size - 1
+    if end < start:
+        raise ValueError("Range end before start")
     return start, end
 
 
@@ -90,15 +84,13 @@ def stream_video_file(
     head_only: bool = False,
 ) -> None:
     """Serve a local video file with full HTTP 206 Partial Content support."""
-    if not file_path.exists() or not file_path.is_file():
+    if not file_path.is_file():
         handler.send_error(HTTPStatus.NOT_FOUND, "Video file not found on disk")
         return
 
     file_size = file_path.stat().st_size
-    content_type = guess_video_mime(file_path)
-    range_header = handler.headers.get("Range")
-
-    if range_header:
+    byte_range: Optional[tuple[int, int]] = None
+    if range_header := handler.headers.get("Range"):
         try:
             byte_range = parse_range_header(range_header, file_size)
         except ValueError:
@@ -107,8 +99,6 @@ def stream_video_file(
             handler.send_header("Content-Length", "0")
             handler.end_headers()
             return
-    else:
-        byte_range = None
 
     if byte_range is not None:
         start, end = byte_range
@@ -117,11 +107,10 @@ def stream_video_file(
         handler.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
     else:
         start = 0
-        end = max(0, file_size - 1)
         content_length = file_size
         handler.send_response(HTTPStatus.OK)
 
-    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Type", guess_video_mime(file_path))
     handler.send_header("Content-Length", str(content_length))
     handler.send_header("Accept-Ranges", "bytes")
     handler.send_header("Cache-Control", "no-store")

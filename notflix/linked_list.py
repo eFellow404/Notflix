@@ -26,6 +26,10 @@ class EpisodeNode:
     duration_sec: float = 0.0
     watched: bool = False
     file_size: int = 0
+    intro_start_sec: Optional[float] = None
+    intro_end_sec: Optional[float] = None
+    intro_confidence: float = 0.0
+    intro_source: str = ""
     prev: Optional["EpisodeNode"] = field(default=None, repr=False, compare=False)
     next: Optional["EpisodeNode"] = field(default=None, repr=False, compare=False)
 
@@ -81,6 +85,14 @@ class EpisodeNode:
             "watched": self.watched,
             "progress_percent": self.progress_percent,
             "file_size": self.file_size,
+            "intro_start_sec": round(self.intro_start_sec, 2)
+            if self.intro_start_sec is not None
+            else None,
+            "intro_end_sec": round(self.intro_end_sec, 2)
+            if self.intro_end_sec is not None
+            else None,
+            "intro_confidence": round(self.intro_confidence, 2),
+            "intro_source": self.intro_source,
             "display_code": self.display_code,
             "prev_id": self.prev_id,
             "next_id": self.next_id,
@@ -191,12 +203,8 @@ class EpisodeLinkedList:
         self.current = self.current.prev
         return self.current
 
-    def remove(self, episode_id: str) -> Optional[EpisodeNode]:
-        """Unlink and remove a node by ID while keeping head/tail/current valid."""
-        node = self._index.pop(episode_id, None)
-        if node is None:
-            return None
-
+    def _unlink(self, node: EpisodeNode) -> None:
+        """Detach ``node`` from its neighbors and clear its prev/next links."""
         if node.prev is not None:
             node.prev.next = node.next
         else:
@@ -207,11 +215,19 @@ class EpisodeLinkedList:
         else:
             self.tail = node.prev
 
+        node.prev = None
+        node.next = None
+
+    def remove(self, episode_id: str) -> Optional[EpisodeNode]:
+        """Unlink and remove a node by ID while keeping head/tail/current valid."""
+        node = self._index.pop(episode_id, None)
+        if node is None:
+            return None
+
         if self.current is node:
             self.current = node.next if node.next is not None else node.prev
 
-        node.prev = None
-        node.next = None
+        self._unlink(node)
         self._length -= 1
         return node
 
@@ -226,19 +242,7 @@ class EpisodeLinkedList:
         if current_idx == clamped:
             return True
 
-        # Unlink node from its current position
-        if node.prev is not None:
-            node.prev.next = node.next
-        else:
-            self.head = node.next
-
-        if node.next is not None:
-            node.next.prev = node.prev
-        else:
-            self.tail = node.prev
-
-        node.prev = None
-        node.next = None
+        self._unlink(node)
 
         # Splice node into the clamped target index
         if clamped == 0:

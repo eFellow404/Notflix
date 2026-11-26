@@ -9,7 +9,9 @@ A lightweight local TV show player built for plain folders of DVD-ripped video f
 - **Persisted Doubly Linked List**: Stores every show's episode sequence in a genuine doubly linked list (`EpisodeLinkedList` with `head`, `tail`, `current`, and `prev`/`next` pointers persisted in SQLite).
 - **Automatic Timeplace Saving**: Saves your exact playback second periodically, on pause/seek/episode switch, and on tab close (`sendBeacon`), resuming right where you stopped.
 - **Instant Next / Previous Episode**: Click **Next Episode** right at the start of any episode (via the top bar, quick overlay, or `N` shortcut) to step along `current.next` in $O(1)$.
-- **Non-Destructive Rescan & Manual Overrides**: Re-check folders anytime to pick up new or removed files without losing saved watch progress, or move episodes up/down in the linked list manually.
+- **Automatic Intro Detection & Fullscreen Skip Intro**: Finds the repeating opening sequence across episodes (checking MKV/MP4 chapter markers, optional `ffmpeg` audio fingerprints, and built-in zero-dependency browser visual frame matching) and displays an overlay **Skip Intro** button over the video—including in fullscreen—plus a highlighted intro segment on the timeline and manual fine-tuning.
+- **Non-Destructive Rescan & Manual Overrides**: Re-check folders anytime to pick up new or removed files without losing saved watch progress, or customize episode playback order.
+- **Automatic Git Updates (Offline-Safe)**: Checks the configured Git remote on startup (and via the in-app **↻ Updates** button), automatically backs up your SQLite database before updating, fast-forwards cleanly if behind, and skips gracefully without crashing when offline or if local edits exist.
 
 ## Quickstart
 
@@ -25,16 +27,21 @@ Then open **http://127.0.0.1:8080** in your browser.
 
 ```bash
 python3 run.py --host 127.0.0.1 --port 8080 --db ./my_notflix.db
+python3 run.py --no-auto-update       # Skip startup remote update check
+python3 run.py --check-update         # Check remote status and exit
+python3 run.py --update-timeout 5     # Network timeout in seconds (default: 5)
 ```
 
 ## Keyboard Shortcuts (Watch View)
 
 - `Space` / `K` — Play / Pause
 - `←` / `→` — Seek backward / forward 10 seconds
+- `S` — Skip Intro (when active)
+- `M` — Mute / Unmute
 - `N` — Next episode (`current.next`)
 - `P` — Previous episode (`current.prev`)
 - `R` — Restart current episode from `0:00`
-- `F` — Toggle fullscreen
+- `F` — Toggle fullscreen (keeps Skip Intro and Up Next overlays visible)
 
 ## Running Tests
 

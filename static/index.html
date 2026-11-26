@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Notflix — Local TV Player</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <button id="brandBtn" class="brand" type="button" title="Back to Library">
+        <span class="brand-mark">N</span>
+        <span class="brand-text">NOTFLIX</span>
+      </button>
+      <span class="brand-tag">DVD TV Library</span>
+    </div>
+    <div class="topbar-right">
+      <button id="navLibraryBtn" class="btn btn-ghost hidden" type="button">← Library</button>
+      <button id="openAddModalBtn" class="btn btn-primary" type="button">+ Add TV Folder</button>
+    </div>
+  </header>
+
+  <main class="main-shell">
+    <!-- LIBRARY VIEW -->
+    <section id="libraryView" class="view">
+      <div id="continueHero" class="hero hidden"></div>
+
+      <div class="section-header">
+        <div>
+          <h1>Your TV Shows</h1>
+          <p class="muted">Plain folders of DVD rips — automatically ordered into an episode linked list.</p>
+        </div>
+      </div>
+
+      <div id="showsGrid" class="shows-grid"></div>
+
+      <div id="emptyLibrary" class="empty-state hidden">
+        <div class="empty-icon">📺</div>
+        <h2>No TV folders added yet</h2>
+        <p>
+          Point Notflix at any folder containing your DVD-ripped episodes. It automatically
+          detects seasons, discs, and episode order, stores them in a linked list, and remembers
+          your exact timeplace when you stop watching.
+        </p>
+        <button id="emptyAddBtn" class="btn btn-primary btn-lg" type="button">+ Add Your First TV Folder</button>
+      </div>
+    </section>
+
+    <!-- WATCH / PLAYER VIEW -->
+    <section id="watchView" class="view hidden">
+      <div class="watch-header">
+        <div class="watch-title-group">
+          <div class="watch-breadcrumb">
+            <span id="watchShowName" class="show-label"></span>
+            <span class="sep">/</span>
+            <span id="watchChainPos" class="chain-pos"></span>
+          </div>
+          <div class="watch-ep-heading">
+            <span id="watchEpCode" class="ep-code-badge"></span>
+            <h2 id="watchEpTitle"></h2>
+          </div>
+        </div>
+
+        <div class="watch-actions">
+          <span id="saveStatusPill" class="save-pill">Ready</span>
+          <button id="prevEpBtn" class="btn btn-secondary" type="button" title="Previous Episode (P)">
+            ← Prev
+          </button>
+          <button id="restartEpBtn" class="btn btn-ghost" type="button" title="Restart from 0:00 (R)">
+            ↺ 0:00
+          </button>
+          <button id="nextEpBtn" class="btn btn-primary" type="button" title="Next Episode (N)">
+            Next Episode →
+          </button>
+        </div>
+      </div>
+
+      <div class="watch-layout">
+        <div class="player-column">
+          <div class="player-stage" id="playerStage">
+            <video id="videoPlayer" controls playsinline preload="metadata"></video>
+
+            <!-- Quick Next Episode pill available immediately at the start of an episode -->
+            <div id="quickNextOverlay" class="quick-next-overlay hidden">
+              <button id="quickNextBtn" class="btn btn-primary btn-sm" type="button">
+                Next Episode → <span id="quickNextTitle"></span>
+              </button>
+            </div>
+
+            <!-- Up Next prompt near the end or on completion -->
+            <div id="upNextCard" class="up-next-card hidden">
+              <div class="up-next-label">UP NEXT IN LINKED LIST</div>
+              <div id="upNextTitle" class="up-next-title"></div>
+              <div class="up-next-actions">
+                <button id="upNextPlayBtn" class="btn btn-primary btn-sm" type="button">▶ Play Next Episode</button>
+                <button id="upNextDismissBtn" class="btn btn-ghost btn-sm" type="button">Stay Here</button>
+              </div>
+            </div>
+
+            <!-- Codec / File error banner -->
+            <div id="playerErrorBanner" class="player-error hidden">
+              <div class="player-error-title">Unable to play this video format in browser</div>
+              <p id="playerErrorMsg"></p>
+              <code id="playerErrorPath"></code>
+            </div>
+          </div>
+
+          <div class="player-meta-bar">
+            <div class="meta-item">
+              <span class="meta-label">File</span>
+              <span id="metaRelativePath" class="meta-value"></span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">Ordering Intelligence</span>
+              <span id="metaSortReason" class="meta-value"></span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">Linked List Links</span>
+              <span id="metaChainLinks" class="meta-value"></span>
+            </div>
+          </div>
+
+          <div class="shortcuts-hint">
+            Shortcuts: <kbd>Space</kbd> Play/Pause · <kbd>←</kbd>/<kbd>→</kbd> ±10s · <kbd>N</kbd> Next Episode · <kbd>P</kbd> Prev Episode · <kbd>R</kbd> Restart · <kbd>F</kbd> Fullscreen
+          </div>
+        </div>
+
+        <!-- EPISODE LINKED LIST DRAWER -->
+        <aside class="chain-sidebar">
+          <div class="chain-header">
+            <div>
+              <h3>Episode Linked List</h3>
+              <p id="chainSummary" class="muted small"></p>
+            </div>
+            <div class="chain-header-actions">
+              <button id="rescanShowBtn" class="btn btn-secondary btn-sm" type="button" title="Check folder for added or removed files">
+                ↻ Rescan
+              </button>
+              <button id="resetSmartSortBtn" class="btn btn-ghost btn-sm hidden" type="button" title="Re-run automatic smart ordering">
+                ✦ Smart Sort
+              </button>
+            </div>
+          </div>
+          <div id="episodeList" class="episode-list"></div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <!-- ADD TV FOLDER MODAL -->
+  <div id="addModalBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="addModalTitle">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="addModalTitle">Add TV Show Folder</h2>
+        <button id="closeAddModalBtn" class="icon-btn" type="button" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <label class="field">
+          <span>Show Name (optional — defaults to folder name)</span>
+          <input id="showNameInput" type="text" placeholder="e.g. Firefly, The Office, Avatar..." />
+        </label>
+
+        <label class="field">
+          <span>Folder Path</span>
+          <div class="path-input-row">
+            <input id="folderPathInput" type="text" placeholder="/path/to/TV Show Folder" />
+            <button id="browseGoBtn" class="btn btn-secondary btn-sm" type="button">Open</button>
+          </div>
+        </label>
+
+        <div class="browser-box">
+          <div class="browser-toolbar">
+            <button id="browseUpBtn" class="btn btn-ghost btn-sm" type="button">↑ Up</button>
+            <span id="browserCurrentPath" class="browser-path"></span>
+            <span id="browserVideoBadge" class="video-count-badge"></span>
+          </div>
+          <div id="browserList" class="browser-list"></div>
+        </div>
+
+        <div id="addModalError" class="form-error hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="cancelAddModalBtn" class="btn btn-ghost" type="button">Cancel</button>
+        <button id="confirmAddShowBtn" class="btn btn-primary" type="button">Scan &amp; Add Folder</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TOAST CONTAINER -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <script src="/static/app.js" type="module"></script>
+</body>
+</html>

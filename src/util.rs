@@ -274,8 +274,8 @@ mod tests {
 
     #[test]
     fn lexical_normalize_collapses_dot_and_dotdot() {
-        let p = lexical_normalize(Path::new("/a/b/../c/./d"));
-        assert_eq!(p, PathBuf::from("/a/c/d"));
+        let p = lexical_normalize(Path::new("a/b/../c/./d"));
+        assert_eq!(p, PathBuf::from("a").join("c").join("d"));
     }
 
     #[test]

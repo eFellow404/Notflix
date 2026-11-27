@@ -9,6 +9,95 @@ const NEIGHBOR_DECAY: f64 = 0.88;
 const FLAT_SIM: f64 = -2.0;
 /// Sentinel representing an inactive/flat pair cell in the flat similarity matrix.
 const NO_SIM: f64 = f64::NEG_INFINITY;
+/// Maximum contiguous mismatch duration (seconds) allowed inside a single intro sequence.
+/// Any longer mismatch gap (e.g. real episode cold-open content between a studio logo and
+/// the theme song) forces a hard split so real content is never bridged and skipped.
+const MAX_INTERIOR_MISMATCH_SEC: f64 = 3.0;
+
+#[inline]
+fn max_gap_debt_for_step(step_sec: f64) -> usize {
+    let max_mismatch_frames = ((MAX_INTERIOR_MISMATCH_SEC / step_sec).round() as usize).max(2);
+    max_mismatch_frames * 2
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameMatchKind {
+    Match,
+    Flat,
+    Mismatch,
+}
+
+/// Extract the strongest contiguous matching sub-run from `[0, len)` without ever bridging
+/// an interior gap of real non-matching content exceeding `max_gap_debt`.
+///
+/// Uses a leaky gap counter (`+2` per mismatch, `+1` per flat/black frame, `-1` per match)
+/// so even a real-content gap containing isolated accidental matches still triggers a split,
+/// while 1–2s glitches or brief title cards inside a true intro remain intact.
+fn best_contiguous_subrun<FKind, FWeight>(
+    len: usize,
+    max_gap_debt: usize,
+    kind_at: FKind,
+    weight_at: FWeight,
+) -> Option<(usize, usize)>
+where
+    FKind: Fn(usize) -> FrameMatchKind,
+    FWeight: Fn(usize) -> f64,
+{
+    let mut best: Option<(usize, usize, f64)> = None;
+    let mut run_start: Option<usize> = None;
+    let mut run_end = 0usize;
+    let mut run_score = 0.0_f64;
+    let mut gap_debt = 0usize;
+
+    let mut commit_run = |start: Option<usize>, end: usize, score: f64| {
+        if let Some(s) = start {
+            if end > s && !best.is_some_and(|b| score <= b.2) {
+                best = Some((s, end, score));
+            }
+        }
+    };
+
+    for k in 0..len {
+        match kind_at(k) {
+            FrameMatchKind::Match => {
+                if run_start.is_none() {
+                    run_start = Some(k);
+                    run_score = 0.0;
+                    gap_debt = 0;
+                } else {
+                    gap_debt = gap_debt.saturating_sub(1);
+                }
+                run_end = k + 1;
+                run_score += weight_at(k);
+            }
+            FrameMatchKind::Flat => {
+                if run_start.is_some() {
+                    gap_debt += 1;
+                    if gap_debt > max_gap_debt {
+                        commit_run(run_start, run_end, run_score);
+                        run_start = None;
+                        run_score = 0.0;
+                        gap_debt = 0;
+                    }
+                }
+            }
+            FrameMatchKind::Mismatch => {
+                if run_start.is_some() {
+                    gap_debt += 2;
+                    if gap_debt > max_gap_debt {
+                        commit_run(run_start, run_end, run_score);
+                        run_start = None;
+                        run_score = 0.0;
+                        gap_debt = 0;
+                    }
+                }
+            }
+        }
+    }
+    commit_run(run_start, run_end, run_score);
+
+    best.map(|(s, e, _)| (s, e))
+}
 
 #[inline]
 fn dot(a: &[f64], b: &[f64]) -> f64 {
@@ -144,6 +233,7 @@ fn find_best_shared_segment(
     let mismatch_penalty = -1.25;
     let flat_penalty = -0.25;
     let min_mean_sim = sim_threshold.max(0.72);
+    let max_gap_debt = max_gap_debt_for_step(step);
 
     let d_min = -((na - min_frames) as isize);
     let d_max = (nb - min_frames) as isize;
@@ -157,6 +247,7 @@ fn find_best_shared_segment(
 
         let mut cur_score = 0.0;
         let mut seg_start = i_start;
+        let mut gap_debt = 0usize;
         let mut best_diag_score = 0.0;
         let mut best_diag_range: Option<(usize, usize)> = None;
 
@@ -164,16 +255,27 @@ fn find_best_shared_segment(
             let j = (i as isize + d) as usize;
             let s = sim_grid[i * nb + j];
             let weight = if !s.is_finite() {
+                if cur_score > 0.0 {
+                    gap_debt += 1;
+                }
                 flat_penalty
             } else if s >= sim_threshold {
+                gap_debt = gap_debt.saturating_sub(1);
                 s - baseline
             } else {
+                if cur_score > 0.0 {
+                    gap_debt += 2;
+                }
                 mismatch_penalty
             };
 
-            if cur_score + weight <= 0.0 {
+            // Hard-break across any multi-second non-matching gap so a repeating bumper/logo
+            // at the start of an episode can never bridge across real cold-open content into
+            // the intro sequence.
+            if gap_debt > max_gap_debt || cur_score + weight <= 0.0 {
                 cur_score = 0.0;
                 seg_start = i + 1;
+                gap_debt = 0;
             } else {
                 cur_score += weight;
                 let mut seg_len = (i + 1) - seg_start;
@@ -243,7 +345,7 @@ fn find_best_shared_segment(
         }
         let matched_ratio = (matched as f64) / (seg_len as f64);
         let mean_sim = sim_sum / (sim_count as f64);
-        if matched_ratio < 0.65 || mean_sim < min_mean_sim {
+        if matched_ratio < 0.72 || mean_sim < min_mean_sim {
             continue;
         }
 
@@ -451,11 +553,31 @@ fn refine_template_with_consensus(
         return (tmpl_start, tmpl_end);
     }
 
-    // Require at least 60% of the other matching episodes (and >= 2) to agree on edge frames
+    // Require at least 60% of the other matching episodes (and >= 2) to agree on template frames,
+    // and extract the strongest contiguous core so any interior low-consensus valley (real
+    // content between an opening bumper and the intro) is cleanly split out.
     let min_votes = ((matching_others * 6).div_ceil(10)).max(2);
+    let max_gap_debt = max_gap_debt_for_step(anchor_fp.step_sec);
 
-    let mut trim_start = 0usize;
-    let mut trim_end = t_len;
+    let Some((core_start, core_end)) = best_contiguous_subrun(
+        t_len,
+        max_gap_debt,
+        |k| {
+            if frame_votes[k] >= min_votes {
+                FrameMatchKind::Match
+            } else if template_flats[k] || template_vecs[k].is_empty() {
+                FrameMatchKind::Flat
+            } else {
+                FrameMatchKind::Mismatch
+            }
+        },
+        |k| frame_votes[k] as f64,
+    ) else {
+        return (tmpl_start, tmpl_end);
+    };
+
+    let mut trim_start = core_start;
+    let mut trim_end = core_end;
     while trim_start + 1 < trim_end {
         if frame_votes[trim_start] >= min_votes && frame_votes[trim_start + 1] >= min_votes {
             break;
@@ -484,24 +606,58 @@ fn align_episode_to_template(
     sim_threshold: f64,
 ) -> Option<IntroSpan> {
     let aln = find_best_template_offset(ep_fp, template_vecs, template_flats, sim_threshold)?;
-    if aln.best_ratio < 0.58 || aln.best_mean < sim_threshold.max(0.70) {
+    if aln.best_ratio < 0.62 || aln.best_mean < sim_threshold.max(0.70) {
         return None;
     }
 
     let best_offset = aln.best_offset;
     let t_len = template_vecs.len();
-    let (trim_start, trim_end) = trim_matching_edges(
+    let max_gap_debt = max_gap_debt_for_step(ep_fp.step_sec);
+
+    // Extract the strongest contiguous matching sub-run so an interior mismatch gap in this
+    // episode is never bridged into the intro span.
+    let (sub_start, sub_end) = best_contiguous_subrun(
         t_len,
+        max_gap_debt,
+        |k| {
+            let s = aln.frame_sims[k];
+            if s >= sim_threshold {
+                FrameMatchKind::Match
+            } else if template_flats[k]
+                || template_vecs[k].is_empty()
+                || ep_fp.flat_flags[best_offset + k]
+                || ep_fp.vectors[best_offset + k].is_empty()
+            {
+                FrameMatchKind::Flat
+            } else {
+                FrameMatchKind::Mismatch
+            }
+        },
+        |k| aln.frame_sims[k].max(0.0),
+    )?;
+
+    let (trim_start, trim_end) = trim_matching_edges(
+        sub_end - sub_start,
         sim_threshold,
-        |k| aln.frame_sims[k] >= sim_threshold,
-        |k| aln.exact_frame_sims[k],
+        |rel| aln.frame_sims[sub_start + rel] >= sim_threshold,
+        |rel| aln.exact_frame_sims[sub_start + rel],
     );
 
-    let (start_idx, end_idx) = if trim_end <= trim_start {
-        (best_offset, best_offset + t_len)
-    } else {
-        (best_offset + trim_start, best_offset + trim_end)
-    };
+    let local_start = sub_start + trim_start;
+    let local_end = sub_start + trim_end;
+    if local_end <= local_start {
+        return None;
+    }
+
+    let start_idx = best_offset + local_start;
+    let end_idx = best_offset + local_end;
+    let span_frames = local_end - local_start;
+    let matched_in_span = (local_start..local_end)
+        .filter(|&k| aln.frame_sims[k] >= sim_threshold)
+        .count();
+    if (matched_in_span as f64) / (span_frames as f64) < 0.70 {
+        return None;
+    }
 
     let start_sec = (start_idx as f64) * ep_fp.step_sec;
     let end_sec = (end_idx as f64) * ep_fp.step_sec;

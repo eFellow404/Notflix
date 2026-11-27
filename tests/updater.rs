@@ -48,6 +48,7 @@ fn create_bare_and_clone(base: &Path) -> (PathBuf, PathBuf, PathBuf) {
     git(&remote_dir, &["init", "--bare", "-b", "main"]);
     git(&author_dir, &["init", "-b", "main"]);
     git(&author_dir, &["config", "commit.gpgsign", "false"]);
+    git(&author_dir, &["config", "core.autocrlf", "false"]);
     git(&author_dir, &["config", "user.name", "Test User"]);
     git(&author_dir, &["config", "user.email", "test@example.com"]);
     fs::write(author_dir.join("app.txt"), "v1\n").expect("write app.txt");
@@ -63,11 +64,14 @@ fn create_bare_and_clone(base: &Path) -> (PathBuf, PathBuf, PathBuf) {
         base,
         &[
             "clone",
+            "-c",
+            "core.autocrlf=false",
             remote_dir.to_str().unwrap(),
             local_dir.to_str().unwrap(),
         ],
     );
     git(&local_dir, &["config", "commit.gpgsign", "false"]);
+    git(&local_dir, &["config", "core.autocrlf", "false"]);
     git(&local_dir, &["config", "user.name", "Test User"]);
     git(&local_dir, &["config", "user.email", "test@example.com"]);
 
@@ -126,13 +130,17 @@ fn check_and_apply_update_fast_forwards_and_preserves_user_db() {
     let backup_file = PathBuf::from(&backup_path_str);
     assert!(backup_file.is_file());
 
-    // Code updated cleanly
+    // Code updated cleanly (normalize CRLF in case host Git overrides autocrlf)
     assert_eq!(
-        fs::read_to_string(local_dir.join("app.txt")).expect("read app.txt"),
+        fs::read_to_string(local_dir.join("app.txt"))
+            .expect("read app.txt")
+            .replace("\r\n", "\n"),
         "v2\n"
     );
     assert_eq!(
-        fs::read_to_string(local_dir.join("feature.txt")).expect("read feature.txt"),
+        fs::read_to_string(local_dir.join("feature.txt"))
+            .expect("read feature.txt")
+            .replace("\r\n", "\n"),
         "new feature\n"
     );
 

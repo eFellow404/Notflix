@@ -701,3 +701,91 @@ fn stray_pre_intro_frames_and_fade_do_not_shift_start_early() {
         detected["ep2"].start_sec
     );
 }
+
+#[test]
+fn opening_logo_and_intro_never_bridge_real_content_gap() {
+    let mut rng = Rng::new(9001);
+    let step = 1.0;
+
+    // Every episode begins with an identical 14s studio/network bumper at 0..14s,
+    // followed by real unique cold-open content (16s), then the real 45s intro at 30..75s!
+    // Even on diagonal d = 0 (where both bumper and intro align identically across episodes)
+    // and with a couple of accidental matching frames + fades inside the cold open,
+    // the detector must NEVER connect 0..14s and 30..75s across the real content.
+    let opening_bumper: Vec<Vec<f64>> = (0..14).map(|_| rand_vec(&mut rng, 72)).collect();
+    let true_intro: Vec<Vec<f64>> = (0..45).map(|_| rand_vec(&mut rng, 72)).collect();
+    let lucky_frame = rand_vec(&mut rng, 72);
+    let black = vec![2.0; 72];
+
+    let mut fps = Vec::new();
+    for (id, intro_start) in [("ep1", 30), ("ep2", 30), ("ep3", 30), ("ep4", 42)] {
+        let mut frames = make_episode_vectors(&mut rng, 140, Some(&true_intro), intro_start, 5.0);
+        for (k, v) in opening_bumper.iter().enumerate() {
+            frames[k] = perturb_vec(&mut rng, v, 5.0);
+        }
+        // Inject a fade and an isolated lucky matching frame inside the real cold open
+        frames[14] = black.clone();
+        frames[19] = perturb_vec(&mut rng, &lucky_frame, 4.0);
+        frames[29] = black.clone();
+        fps.push(build_fingerprint(
+            id, step, &frames, None, 0.0, "visual", 8.0,
+        ));
+    }
+
+    let detected = find_shared_intros_default(&fps);
+    assert_eq!(detected.len(), 4);
+    for (id, expected_start) in [("ep1", 30.0), ("ep2", 30.0), ("ep3", 30.0), ("ep4", 42.0)] {
+        let span = &detected[id];
+        assert!(
+            (span.start_sec - expected_start).abs() <= 2.0,
+            "{id}: bridged opening bumper across real content! got {:.2}s..{:.2}s (expected ~{expected_start}s..{}s)",
+            span.start_sec,
+            span.end_sec,
+            expected_start + 45.0,
+        );
+        assert!(
+            (span.end_sec - (expected_start + 45.0)).abs() <= 2.0,
+            "{id}: end off target: got {:.2}s (expected ~{}s)",
+            span.end_sec,
+            expected_start + 45.0,
+        );
+    }
+}
+
+#[test]
+fn opening_fanfare_and_audio_theme_never_bridge_cold_open() {
+    let sample_rate = 4000usize;
+    let mut rng = Rng::new(4242);
+
+    // 10s shared studio fanfare at 0..10s, 14s unique dialogue cold open at 10..24s,
+    // then 38s shared theme song at 24..62s on the exact same diagonal (d = 0).
+    let fanfare = synth_theme_song_pcm(10, sample_rate);
+    let theme = synth_theme_song_pcm(38, sample_rate);
+
+    let mut ep1_pcm = synth_speech_like_pcm(&mut rng, 130, sample_rate);
+    let mut ep2_pcm = synth_speech_like_pcm(&mut rng, 130, sample_rate);
+    ep1_pcm[0..10 * sample_rate].copy_from_slice(&fanfare);
+    ep2_pcm[0..10 * sample_rate].copy_from_slice(&fanfare);
+    ep1_pcm[24 * sample_rate..62 * sample_rate].copy_from_slice(&theme);
+    ep2_pcm[24 * sample_rate..62 * sample_rate].copy_from_slice(&theme);
+
+    let fp1 = extract_audio_fingerprint_from_pcm(&ep1_pcm, "ep1", 1.0).expect("fp1");
+    let fp2 = extract_audio_fingerprint_from_pcm(&ep2_pcm, "ep2", 1.0).expect("fp2");
+
+    let detected = find_shared_intros_default(&[fp1, fp2]);
+    assert_eq!(detected.len(), 2);
+    for id in ["ep1", "ep2"] {
+        let span = &detected[id];
+        assert!(
+            (span.start_sec - 24.0).abs() <= 2.0,
+            "{id}: audio bridged opening fanfare across cold open! got {:.2}s..{:.2}s (expected ~24..62s)",
+            span.start_sec,
+            span.end_sec
+        );
+        assert!(
+            (span.end_sec - 62.0).abs() <= 2.0,
+            "{id}: audio end off target: got {:.2}s (expected ~62s)",
+            span.end_sec
+        );
+    }
+}

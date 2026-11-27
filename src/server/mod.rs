@@ -33,6 +33,7 @@ pub struct AppState {
     pub store: NotflixStore,
     pub static_dir: Option<PathBuf>,
     pub repo_dir: Arc<StdMutex<PathBuf>>,
+    pub allow_release_fallback: Arc<StdMutex<bool>>,
     pub update_lock: Arc<AsyncMutex<()>>,
     pub last_update_result: Arc<StdMutex<Option<UpdateResult>>>,
     pub quiet: bool,
@@ -46,6 +47,7 @@ impl AppState {
         initial_update_result: Option<UpdateResult>,
         quiet: bool,
     ) -> Self {
+        let allow_release_fallback = repo_dir.is_none();
         let candidate_repo = repo_dir.unwrap_or_else(default_repo_dir);
         let resolved_repo =
             canonicalize_clean(&candidate_repo).unwrap_or_else(|_| default_repo_dir());
@@ -54,6 +56,7 @@ impl AppState {
             store,
             static_dir: resolved_static,
             repo_dir: Arc::new(StdMutex::new(resolved_repo)),
+            allow_release_fallback: Arc::new(StdMutex::new(allow_release_fallback)),
             update_lock: Arc::new(AsyncMutex::new(())),
             last_update_result: Arc::new(StdMutex::new(initial_update_result)),
             quiet,
@@ -67,12 +70,24 @@ impl AppState {
             .clone()
     }
 
+    pub fn allow_release_fallback(&self) -> bool {
+        *self
+            .allow_release_fallback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub fn set_repo_dir(&self, dir: PathBuf) {
         let mut guard = self
             .repo_dir
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = dir;
+        let mut fallback = self
+            .allow_release_fallback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *fallback = false;
     }
 }
 
@@ -84,6 +99,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/update/check", post(system::handle_update_check))
         .route("/api/update/apply", post(system::handle_update_apply))
         .route("/api/fs/browse", get(shows::handle_fs_browse))
+        .route("/api/library/export", get(shows::handle_export_library))
+        .route("/api/library/import", post(shows::handle_import_library))
         .route(
             "/api/shows",
             get(shows::handle_list_shows).post(shows::handle_create_show),
@@ -95,6 +112,7 @@ pub fn build_router(state: AppState) -> Router {
                 .post(shows::handle_rename_show)
                 .delete(shows::handle_delete_show),
         )
+        .route("/api/shows/{id}/poster", get(shows::handle_show_poster))
         .route("/api/shows/{id}/rescan", post(shows::handle_rescan_show))
         .route("/api/shows/{id}/next", post(shows::handle_next_episode))
         .route("/api/shows/{id}/prev", post(shows::handle_prev_episode))
@@ -115,6 +133,18 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/episodes/{id}/intro",
             patch(episodes::handle_intro_update).post(episodes::handle_intro_update),
+        )
+        .route(
+            "/api/episodes/{id}/tracks",
+            get(episodes::handle_episode_tracks),
+        )
+        .route(
+            "/api/episodes/{id}/subtitles/{index}",
+            get(episodes::handle_episode_subtitle),
+        )
+        .route(
+            "/api/episodes/{id}/thumbnail",
+            get(episodes::handle_episode_thumbnail),
         )
         .route(
             "/api/episodes/{id}/stream",

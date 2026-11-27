@@ -36,10 +36,37 @@ export const state = {
   introScanToken: 0,
   introScanning: false,
 
+  // Subtitle, audio track & remux state
+  tracksRequestToken: 0,
+  subtitleTracks: [],
+  activeSubtitleIndex: -1,
+  audioTracks: [],
+  activeAudioIndex: 0,
+  needsRemuxHint: false,
+  remuxMode: false,
+  remuxOffsetSec: 0,
+  pendingRemuxSeekSec: null,
+
   // Modal targets
   pendingRenameShowId: null,
   pendingDeleteShowId: null,
 };
+
+export function getEffectiveTime(video) {
+  const base = state.remuxMode ? state.remuxOffsetSec : 0;
+  const raw = video && Number.isFinite(video.currentTime) ? video.currentTime : 0;
+  return Math.max(0, base + raw);
+}
+
+export function getEffectiveDuration(video) {
+  const epDur = state.currentEpisode?.duration_sec || 0;
+  const vDur = video && Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+  if (state.remuxMode) {
+    if (epDur > 0) return epDur;
+    return vDur > 0 ? state.remuxOffsetSec + vDur : 0;
+  }
+  return vDur > 0 ? vDur : epDur;
+}
 
 const episodeById = new Map();
 

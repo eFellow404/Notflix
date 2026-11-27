@@ -72,9 +72,13 @@ function renderContinueHero(allShows) {
     heroShow.season_count > 0
       ? `${heroShow.season_count} season${heroShow.season_count === 1 ? "" : "s"} · `
       : "";
+  const backdropHtml = heroShow.has_poster
+    ? `<div class="hero-backdrop" aria-hidden="true"><img src="/api/shows/${heroShow.id}/poster" alt="" onerror="this.parentElement.remove()" /></div>`
+    : "";
 
   continueHero.classList.remove("hidden");
   continueHero.innerHTML = `
+    ${backdropHtml}
     <div class="hero-content">
       <div class="hero-eyebrow">${heroShow.last_watched_at ? "Continue Watching" : "Ready To Watch"}</div>
       <h2>${escapeHtml(heroShow.name)}</h2>
@@ -105,6 +109,55 @@ function renderContinueHero(allShows) {
   `;
 }
 
+function renderContinueStrip(allShows) {
+  const section = byId("continueSection");
+  const strip = byId("continueStrip");
+  if (!section || !strip) return;
+
+  const inProgress = allShows
+    .filter((s) => s.last_watched_at && s.watched_count < s.episode_count && s.current_episode)
+    .sort((a, b) => String(b.last_watched_at).localeCompare(String(a.last_watched_at)));
+
+  if (inProgress.length < 2) {
+    section.classList.add("hidden");
+    strip.innerHTML = "";
+    return;
+  }
+
+  section.classList.remove("hidden");
+  strip.innerHTML = inProgress
+    .map((show) => {
+      const ep = show.current_episode;
+      const posterImg = show.has_poster
+        ? `<img class="show-poster-img" src="/api/shows/${show.id}/poster" alt="" loading="lazy" onerror="this.remove()" />`
+        : "";
+      const resumeMeta =
+        ep.position_sec > 2 ? formatTime(ep.position_sec) : "Up next";
+      return `
+        <button class="continue-card" type="button" data-continue-show="${show.id}" title="Resume ${escapeHtml(show.name)} · ${escapeHtml(ep.display_code)}">
+          <div class="continue-card-art" style="background: ${showPosterStyle(show.name)}">
+            <span class="show-poster-monogram">${escapeHtml(showMonogram(show.name))}</span>
+            ${posterImg}
+            <span class="continue-card-play" aria-hidden="true">▶</span>
+            <div class="continue-card-progress">
+              <div class="progress-track">
+                <div class="progress-fill" style="width: ${ep.progress_percent}%"></div>
+              </div>
+            </div>
+          </div>
+          <div class="continue-card-body">
+            <div class="continue-card-title">${escapeHtml(show.name)}</div>
+            <div class="continue-card-meta">
+              <span class="continue-card-code">${escapeHtml(ep.display_code)}</span>
+              <span class="muted">· ${escapeHtml(resumeMeta)}</span>
+            </div>
+          </div>
+        </button>
+      `;
+    })
+    .join("");
+}
+
 export function renderLibrary() {
   const allShows = state.shows;
   const showsGrid = byId("showsGrid");
@@ -112,6 +165,7 @@ export function renderLibrary() {
 
   if (allShows.length === 0) {
     byId("continueHero").classList.add("hidden");
+    byId("continueSection")?.classList.add("hidden");
     byId("libraryHeader").classList.add("hidden");
     libraryNoResults.classList.add("hidden");
     showsGrid.innerHTML = "";
@@ -124,6 +178,7 @@ export function renderLibrary() {
   byId("libraryToolbar").classList.toggle("hidden", allShows.length < 2);
 
   renderContinueHero(allShows);
+  renderContinueStrip(allShows);
 
   const shows = getFilteredSortedShows();
   if (shows.length === 0) {
@@ -151,12 +206,16 @@ export function renderLibrary() {
           </div>
         `
         : `<div class="show-current-box muted">No video files found in this folder yet.</div>`;
+      const posterImg = show.has_poster
+        ? `<img class="show-poster-img" src="/api/shows/${show.id}/poster" alt="" loading="lazy" onerror="this.remove()" />`
+        : "";
 
       return `
         <article class="show-card">
           <div class="show-card-top">
             <div class="show-poster" style="background: ${showPosterStyle(show.name)}" data-open-show="${show.id}" aria-hidden="true">
-              ${escapeHtml(showMonogram(show.name))}
+              <span class="show-poster-monogram">${escapeHtml(showMonogram(show.name))}</span>
+              ${posterImg}
             </div>
             <div class="show-card-meta">
               <div class="show-card-title-row">
@@ -433,6 +492,73 @@ export function initLibrary(hooks = {}) {
         advanceNextImmediately: true,
         autoPlay: true,
       });
+    }
+  });
+
+  // Delegated Continue Watching strip clicks
+  byId("continueStrip")?.addEventListener("click", (ev) => {
+    const card = ev.target.closest("[data-continue-show]");
+    if (!card) return;
+    callbacks.onOpenShow(card.dataset.continueShow, { autoPlay: true });
+  });
+
+  // Export & Import watch history
+  byId("btnExportLibrary")?.addEventListener("click", async () => {
+    try {
+      const res = await fetch("/api/library/export");
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Export failed (${res.status})`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "notflix-watch-history.json";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      showToast("Exported watch history (notflix-watch-history.json)", "success");
+    } catch (err) {
+      showToast(`Export failed: ${err.message}`);
+    }
+  });
+
+  const importInput = byId("importFileInput");
+  byId("btnImportLibrary")?.addEventListener("click", () => {
+    if (!importInput) return;
+    importInput.value = "";
+    importInput.click();
+  });
+
+  importInput?.addEventListener("change", async () => {
+    const file = importInput.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        throw new Error("Selected file is not valid JSON.");
+      }
+      const res = await api("/api/library/import", {
+        method: "POST",
+        body: JSON.stringify(parsed),
+      });
+      const s = res.summary || {};
+      const matchedShows = s.matched_shows ?? s.shows_matched ?? 0;
+      const updatedEps = s.updated_episodes ?? s.episodes_updated ?? 0;
+      showToast(
+        `Imported watch history: ${matchedShows} show${matchedShows === 1 ? "" : "s"} matched, ${updatedEps} episode${updatedEps === 1 ? "" : "s"} updated`,
+        "success"
+      );
+      await loadLibrary();
+    } catch (err) {
+      showToast(`Import failed: ${err.message}`);
+    } finally {
+      importInput.value = "";
     }
   });
 

@@ -14,13 +14,14 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub use crate::chapters::{
-    detect_intro_from_chapters, extract_chapters, extract_mkv_chapters, extract_mp4_chapters,
-    is_intro_chapter_title, ChapterMarker,
+    detect_intro_from_chapters, detect_outro_from_chapters, extract_chapters, extract_mkv_chapters,
+    extract_mp4_chapters, is_intro_chapter_title, is_outro_chapter_title, ChapterMarker,
 };
 pub use audio::{
-    extract_audio_fingerprint, extract_audio_fingerprint_from_pcm, DEFAULT_AUDIO_SCAN_SEC,
+    extract_audio_fingerprint, extract_audio_fingerprint_from_pcm, extract_tail_audio_fingerprint,
+    DEFAULT_AUDIO_SCAN_SEC,
 };
-pub use matching::{find_shared_intros, find_shared_intros_default};
+pub use matching::{find_shared_intros, find_shared_intros_default, find_shared_outros};
 
 /// Minimum valid intro length in seconds.
 pub const MIN_INTRO_SEC: f64 = 12.0;
@@ -180,4 +181,55 @@ pub fn detect_show_intros_server(
         "chapters"
     };
     (detected, method.to_string(), true)
+}
+
+/// Run server-side outro/credits detection for a show's episodes.
+///
+/// Tier 1 parses container chapter markers (MKV/WebM/MP4) with zero external dependencies.
+/// Tier 2 optionally extracts tail audio fingerprints via `ffmpeg` and matches repeating
+/// ending sequences across episodes not already detected from chapters.
+pub fn detect_show_outros_server(
+    episodes: &[(String, PathBuf, f64)],
+    use_ffmpeg: bool,
+) -> HashMap<String, IntroSpan> {
+    let mut results: HashMap<String, IntroSpan> = HashMap::new();
+
+    // Tier 1: Container chapter markers
+    for (ep_id, path, dur) in episodes {
+        if !path.exists() {
+            continue;
+        }
+        let chapters = extract_chapters(path);
+        if let Some(span) = detect_outro_from_chapters(&chapters, *dur) {
+            results.insert(ep_id.clone(), span);
+        }
+    }
+
+    // Tier 2: Optional FFmpeg tail acoustic fingerprinting for remaining episodes
+    if use_ffmpeg
+        && episodes.len() >= 2
+        && results.len() < episodes.len()
+        && which::which("ffmpeg").is_ok()
+    {
+        let mut fps = Vec::new();
+        for (ep_id, path, dur) in episodes {
+            if !path.exists() {
+                continue;
+            }
+            if !dur.is_finite() || *dur < 0.0 || (*dur > 0.0 && *dur < 180.0) {
+                continue;
+            }
+            if let Some(fp) = extract_tail_audio_fingerprint(path, ep_id, *dur, 180.0, 0.5) {
+                fps.push(fp);
+            }
+        }
+        if fps.len() >= 2 {
+            let audio_matches = find_shared_outros(&fps);
+            for (ep_id, span) in audio_matches {
+                results.entry(ep_id).or_insert(span);
+            }
+        }
+    }
+
+    results
 }

@@ -1,17 +1,20 @@
 //! Integration tests for the offline-safe automatic Git updater and SQLite DB backups.
 
 use std::fs;
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use notflix::storage::NotflixStore;
 use notflix::updater::{
-    apply_update, auto_update_on_startup, backup_database, check_for_updates, get_local_repo_info,
-    DEFAULT_FETCH_TIMEOUT_SEC,
+    apply_release_update_to_path, apply_update, auto_update_on_startup, backup_database,
+    check_for_updates, check_release_updates_from_url, get_local_repo_info, release_asset_name,
+    release_matches_build, validate_binary_magic_for_os, DEFAULT_FETCH_TIMEOUT_SEC,
 };
 use rusqlite::Connection;
 use tempfile::tempdir;
@@ -308,4 +311,310 @@ fn database_backup_prunes_old_snapshots() {
         .query_row("SELECT name FROM items", [], |row| row.get(0))
         .expect("query preserved row");
     assert_eq!(name, "saved-progress");
+}
+
+#[test]
+fn validate_binary_magic_across_platforms() {
+    // Linux ELF
+    assert!(validate_binary_magic_for_os(
+        b"\x7fELF\x02\x01\x01\x00",
+        "linux"
+    ));
+    assert!(!validate_binary_magic_for_os(b"MZ\x90\x00", "linux"));
+    assert!(!validate_binary_magic_for_os(b"\x7fEL", "linux"));
+    assert!(!validate_binary_magic_for_os(
+        b"<html>not elf</html>",
+        "linux"
+    ));
+
+    // Windows PE/MZ
+    assert!(validate_binary_magic_for_os(
+        b"MZ\x90\x00\x03\x00",
+        "windows"
+    ));
+    assert!(!validate_binary_magic_for_os(b"\x7fELF\x02\x01", "windows"));
+    assert!(!validate_binary_magic_for_os(b"MZ\x90", "windows"));
+
+    // macOS Mach-O (32-bit, 64-bit, universal, big & little endian)
+    for magic in [
+        [0xfe, 0xed, 0xfa, 0xce],
+        [0xce, 0xfa, 0xed, 0xfe],
+        [0xfe, 0xed, 0xfa, 0xcf],
+        [0xcf, 0xfa, 0xed, 0xfe],
+        [0xca, 0xfe, 0xba, 0xbe],
+        [0xbe, 0xba, 0xfe, 0xca],
+    ] {
+        let mut payload = magic.to_vec();
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        assert!(validate_binary_magic_for_os(&payload, "macos"));
+    }
+    assert!(!validate_binary_magic_for_os(b"\x7fELF\x02\x01", "macos"));
+    assert!(!validate_binary_magic_for_os(b"\xcf\xfa\xed", "macos"));
+
+    // Unknown OS
+    assert!(!validate_binary_magic_for_os(b"\x7fELF\x02\x01", "freebsd"));
+}
+
+#[test]
+fn release_matches_build_checks_tag_and_commitish() {
+    assert!(release_matches_build(
+        "build-20261127-023000-4952bb1",
+        "main",
+        "4952bb1"
+    ));
+    assert!(release_matches_build(
+        "build-20261127-023000-4952BB1",
+        "main",
+        "4952bb1"
+    ));
+    assert!(release_matches_build("4952bb1", "main", "4952bb1"));
+    assert!(release_matches_build(
+        "v1.2.3",
+        "4952bb1234567890abcdef1234567890abcdef12",
+        "4952bb1"
+    ));
+
+    // Different SHA
+    assert!(!release_matches_build(
+        "build-20261127-023000-abcdef0",
+        "main",
+        "4952bb1"
+    ));
+    assert!(!release_matches_build("v1.2.3", "main", "4952bb1"));
+
+    // Dev or empty build SHA never matches
+    assert!(!release_matches_build(
+        "build-20261127-023000-4952bb1",
+        "4952bb1234567890",
+        "dev"
+    ));
+    assert!(!release_matches_build("dev", "dev", "dev"));
+    assert!(!release_matches_build(
+        "build-20261127-023000-4952bb1",
+        "main",
+        ""
+    ));
+}
+
+struct MockReleaseServer {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl MockReleaseServer {
+    fn start(tag: &str, asset_name: &str, valid_binary: Vec<u8>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock release server");
+        let addr = listener.local_addr().expect("mock server addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+
+        let tag = tag.to_string();
+        let asset_name = asset_name.to_string();
+
+        let handle = std::thread::spawn(move || {
+            let base = format!("http://{addr}");
+            let valid_json = serde_json::json!({
+                "tag_name": tag,
+                "name": format!("Notflix {tag}"),
+                "target_commitish": "main",
+                "assets": [
+                    {
+                        "name": asset_name,
+                        "browser_download_url": format!("{base}/download/valid")
+                    }
+                ]
+            })
+            .to_string();
+
+            let corrupt_json = serde_json::json!({
+                "tag_name": tag,
+                "name": format!("Notflix {tag}"),
+                "target_commitish": "main",
+                "assets": [
+                    {
+                        "name": asset_name,
+                        "browser_download_url": format!("{base}/download/corrupt")
+                    }
+                ]
+            })
+            .to_string();
+
+            while !stop_flag.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut req_buf = [0u8; 4096];
+                let n = stream.read(&mut req_buf).unwrap_or(0);
+                let req_text = String::from_utf8_lossy(&req_buf[..n]);
+                let path = req_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                let (status_line, content_type, body): (&str, &str, &[u8]) = match path {
+                    "/releases/latest" => {
+                        ("HTTP/1.1 200 OK", "application/json", valid_json.as_bytes())
+                    }
+                    "/releases/corrupt" => (
+                        "HTTP/1.1 200 OK",
+                        "application/json",
+                        corrupt_json.as_bytes(),
+                    ),
+                    "/download/valid" => (
+                        "HTTP/1.1 200 OK",
+                        "application/octet-stream",
+                        valid_binary.as_slice(),
+                    ),
+                    "/download/corrupt" => (
+                        "HTTP/1.1 200 OK",
+                        "text/html",
+                        b"<html><body>corrupted download</body></html>",
+                    ),
+                    _ => ("HTTP/1.1 404 Not Found", "text/plain", b"not found"),
+                };
+
+                let header = format!(
+                    "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+
+        Self {
+            addr,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://{}{}", self.addr, path)
+    }
+}
+
+impl Drop for MockReleaseServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn fake_valid_binary_for_current_os() -> Vec<u8> {
+    let mut bytes = match std::env::consts::OS {
+        "linux" => vec![0x7f, b'E', b'L', b'F'],
+        "windows" => vec![b'M', b'Z', 0x90, 0x00],
+        "macos" => vec![0xcf, 0xfa, 0xed, 0xfe],
+        _ => vec![0x7f, b'E', b'L', b'F'],
+    };
+    bytes.extend_from_slice(b"-notflix-updated-release-binary-v2");
+    bytes
+}
+
+#[test]
+fn check_and_apply_release_update_with_mock_server() {
+    let Some(asset_name) = release_asset_name() else {
+        return;
+    };
+
+    let expected_binary = fake_valid_binary_for_current_os();
+    let tag = "build-20261127-023000-4952bb1";
+    let server = MockReleaseServer::start(tag, asset_name, expected_binary.clone());
+    let latest_url = server.url("/releases/latest");
+    let corrupt_url = server.url("/releases/corrupt");
+
+    // 1. Older build sees update_available
+    let check_avail = check_release_updates_from_url(&latest_url, "1111111", 5.0);
+    assert_eq!(check_avail.status, "update_available");
+    assert_eq!(check_avail.behind_count, 1);
+    assert_eq!(check_avail.branch.as_deref(), Some("release"));
+    assert_eq!(check_avail.remote_sha.as_deref(), Some(tag));
+    assert_eq!(check_avail.remote_short_sha.as_deref(), Some("4952bb1"));
+    assert!(!check_avail.updated);
+
+    // 2. Matching build SHA sees up_to_date
+    let check_current = check_release_updates_from_url(&latest_url, "4952bb1", 5.0);
+    assert_eq!(check_current.status, "up_to_date");
+    assert_eq!(check_current.behind_count, 0);
+    assert!(!check_current.updated);
+
+    // 3. Apply valid release update: backs up DB and atomically replaces binary
+    let tmp = tempdir().expect("tempdir");
+    let target_exe = tmp.path().join("notflix-bin");
+    let original_bytes = b"ORIGINAL-BINARY-V1".to_vec();
+    fs::write(&target_exe, &original_bytes).expect("write original binary");
+
+    let db_path = tmp.path().join("notflix.db");
+    {
+        let conn = Connection::open(&db_path).expect("open db");
+        conn.execute("CREATE TABLE state (k TEXT, v TEXT)", [])
+            .expect("create table");
+        conn.execute("INSERT INTO state VALUES ('ep', 'S01E03')", [])
+            .expect("insert row");
+    }
+
+    let applied =
+        apply_release_update_to_path(&latest_url, &target_exe, "1111111", Some(&db_path), 5.0);
+    assert_eq!(applied.status, "updated");
+    assert!(applied.updated);
+    assert!(applied.restart_required);
+    assert_eq!(applied.branch.as_deref(), Some("release"));
+    assert_eq!(applied.remote_sha.as_deref(), Some(tag));
+
+    let backup_path = PathBuf::from(applied.backup_path.expect("backup_path present"));
+    assert!(backup_path.is_file());
+    let backup_conn = Connection::open(&backup_path).expect("open backup db");
+    let preserved: String = backup_conn
+        .query_row("SELECT v FROM state WHERE k = 'ep'", [], |row| row.get(0))
+        .expect("query backup row");
+    assert_eq!(preserved, "S01E03");
+
+    let replaced_bytes = fs::read(&target_exe).expect("read updated binary");
+    assert_eq!(replaced_bytes, expected_binary);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&target_exe)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "updated binary must be executable");
+    }
+
+    // 4. Corrupt / non-magic payload is rejected safely without modifying target_exe
+    let safe_exe = tmp.path().join("notflix-safe-bin");
+    fs::write(&safe_exe, &original_bytes).expect("write safe binary");
+    let rejected = apply_release_update_to_path(&corrupt_url, &safe_exe, "1111111", None, 5.0);
+    assert_eq!(rejected.status, "error");
+    assert!(!rejected.updated);
+    assert!(rejected.message.contains("integrity"));
+    assert_eq!(
+        fs::read(&safe_exe).expect("read untouched binary"),
+        original_bytes
+    );
+}
+
+#[test]
+fn check_release_updates_unreachable_port_returns_offline() {
+    // Bind and immediately drop a listener to guarantee an unused local port
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+
+    let url = format!("http://127.0.0.1:{port}/releases/latest");
+    let res = check_release_updates_from_url(&url, "1111111", 2.0);
+    assert_eq!(res.status, "offline");
+    assert!(!res.updated);
 }

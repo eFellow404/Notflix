@@ -10,6 +10,7 @@ import {
   openShow,
   refreshCurrentLinksUI,
   saveCurrentProgress,
+  seekToTime,
   updatePlayerControlsUI,
 } from "./js/player.js";
 import {
@@ -23,6 +24,7 @@ import {
 function wireModules() {
   initIntro({
     onIntroUpdated: () => renderSeasonSidebar(),
+    onSeekTo: (targetSec, opts) => seekToTime(targetSec, opts),
     onAfterSkipIntro: () => {
       updatePlayerControlsUI();
       saveCurrentProgress({ immediate: true });

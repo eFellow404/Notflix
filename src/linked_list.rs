@@ -39,6 +39,8 @@ pub struct EpisodeNode {
     pub intro_end_sec: Option<f64>,
     pub intro_confidence: f64,
     pub intro_source: String,
+    pub outro_start_sec: Option<f64>,
+    pub outro_source: String,
 }
 
 impl EpisodeNode {
@@ -106,6 +108,8 @@ impl EpisodeNode {
             intro_end_sec: self.intro_end_sec.map(|v| round_decimals(v, 100.0)),
             intro_confidence: round_decimals(self.intro_confidence, 100.0),
             intro_source: self.intro_source.clone(),
+            outro_start_sec: self.outro_start_sec.map(|v| round_decimals(v, 100.0)),
+            outro_source: self.outro_source.clone(),
             display_code: self.display_code(),
             prev_id,
             next_id,
@@ -138,6 +142,8 @@ pub struct EpisodeJson {
     pub intro_end_sec: Option<f64>,
     pub intro_confidence: f64,
     pub intro_source: String,
+    pub outro_start_sec: Option<f64>,
+    pub outro_source: String,
     pub display_code: String,
     pub prev_id: Option<String>,
     pub next_id: Option<String>,
@@ -700,6 +706,8 @@ mod tests {
             intro_end_sec: None,
             intro_confidence: 0.0,
             intro_source: String::new(),
+            outro_start_sec: None,
+            outro_source: String::new(),
         }
     }
 

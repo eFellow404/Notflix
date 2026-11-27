@@ -11,9 +11,14 @@ A lightweight, single-binary local TV show player written in **Rust**, built for
 - **Async HTTP 206 Video Streaming**: Powered by `tokio` + `axum` with 256 KiB chunked streaming, instant scrubbing, and silent disconnect handling.
 - **Automatic Timeplace Saving**: Saves your exact playback second periodically, on pause/seek/episode switch, and on tab close (`sendBeacon`), resuming right where you stopped.
 - **Instant Next / Previous Episode**: Click **Next Episode** right at the start of any episode (via the top bar, quick overlay, or `N` shortcut) to step along `current.next` in $O(1)$.
-- **Automatic Intro Detection & Fullscreen Skip Intro**: Finds the repeating opening sequence across episodes (checking pure-Rust MKV/MP4 chapter markers, optional `ffmpeg` audio fingerprints, and built-in zero-dependency browser visual frame matching) and displays an overlay **Skip Intro** button over the video—including in fullscreen—plus a highlighted intro segment on the timeline and manual fine-tuning.
+- **Automatic Intro & Outro Detection**: Finds repeating opening sequences across episodes (via pure-Rust MKV/MP4 chapters, optional `ffmpeg` audio fingerprinting, and built-in zero-dependency browser visual frame matching) for fullscreen **Skip Intro**, and detects closing credits/outros to trigger the **Up Next** card right when credits roll.
+- **Automatic Subtitles (`.srt` & `.vtt`)**: Auto-discovers subtitle files beside episodes or inside `Subs/` / `Subtitles/` subfolders, converts `.srt` (including Latin-1/UTF-8) to WebVTT on the fly in pure Rust, and provides a fullscreen **CC** toggle (`C` shortcut).
+- **On-the-Fly Audio Remuxing & Track Selection**: When `ffmpeg`/`ffprobe` is installed, probes audio tracks (flagging browser-incompatible DVD codecs like AC3/DTS/TrueHD) and streams lossless video + AAC audio remuxes with audio track switching and a one-click **Fix Audio (Remux)** fallback.
+- **Local Posters, Thumbnails & Continue Watching**: Automatically renders local show artwork (`poster.jpg`, `folder.png`, `cover.webp`, etc.), sidecar or lazy-cached episode thumbnails, and a horizontal **Continue Watching** strip for shows in progress.
+- **Portable Watch-History Export / Import**: Export and restore your watch progress, watched flags, and intro/outro markers as portable JSON matched across operating systems by folder path or show name.
+- **Auto-Open Browser on Launch**: Automatically opens Notflix in your default browser on startup (disable with `--no-open` or `NOTFLIX_NO_OPEN=1`).
 - **Non-Destructive Rescan & Manual Overrides**: Re-check folders anytime to pick up new or removed files without losing saved watch progress, or customize episode playback order.
-- **Automatic Git Updates (Offline-Safe)**: Checks the configured Git remote on startup (and via the in-app **↻ Updates** button), automatically creates WAL-safe SQLite backups before updating, fast-forwards cleanly if behind, and skips gracefully without crashing when offline or running outside a Git checkout.
+- **Automatic Git & GitHub Releases Updates (Offline-Safe)**: Updates seamlessly from either a Git checkout or standalone GitHub Releases binaries (pure-Rust TLS, magic-byte integrity verification, WAL-safe SQLite backup before swap, and automatic `.old` cleanup on Windows).
 
 ## Quickstart
 
@@ -39,6 +44,7 @@ Then open **http://127.0.0.1:8080** in your browser.
 ```bash
 notflix --host 127.0.0.1 --port 8080 --db ./my_notflix.db
 notflix --static-dir ./static          # Serve live frontend files from disk (dev mode)
+notflix --no-open                      # Do not auto-open the web browser on startup
 notflix --quiet                        # Suppress HTTP logs
 notflix --no-auto-update               # Skip startup remote update check
 notflix --check-update                 # Check remote status and exit
@@ -53,13 +59,14 @@ Notflix builds natively on **Linux** (`x86_64`), **macOS** (Apple Silicon `aarch
 cargo build --release
 ```
 
-GitHub Actions automatically tests and compiles release binaries for all three operating systems (`.github/workflows/ci.yml` and `.github/workflows/release.yml`). Tagging a release (e.g. `git tag v1.1.0 && git push --tags`) publishes prebuilt binaries to GitHub Releases.
+GitHub Actions automatically tests and compiles release binaries for all three operating systems (`.github/workflows/ci.yml` and `.github/workflows/release.yml`), publishing a fresh GitHub Release on every commit pushed to `main` (and on version tags).
 
 ## Keyboard Shortcuts (Watch View)
 
 - `Space` / `K` — Play / Pause
 - `←` / `→` — Seek backward / forward 10 seconds
 - `S` — Skip Intro (when active)
+- `C` — Toggle / cycle Subtitles
 - `M` — Mute / Unmute
 - `N` — Next episode (`current.next`)
 - `P` — Previous episode (`current.prev`)

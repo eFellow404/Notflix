@@ -10,7 +10,8 @@ use tokio::net::TcpListener;
 use notflix::server::{build_router, AppState};
 use notflix::storage::{default_db_path, NotflixStore};
 use notflix::updater::{
-    auto_update_on_startup, check_for_updates, default_repo_dir, UpdateResult,
+    auto_update_on_startup, check_for_updates_with_fallback, cleanup_old_binary_artifacts,
+    default_repo_dir, relaunch_updated_binary, should_relaunch_after_startup_update, UpdateResult,
     DEFAULT_FETCH_TIMEOUT_SEC,
 };
 
@@ -41,17 +42,21 @@ struct Cli {
     #[arg(long)]
     quiet: bool,
 
-    /// Skip automatic remote Git update check on startup
+    /// Skip automatic update check on startup
     #[arg(long)]
     no_auto_update: bool,
 
-    /// Seconds to wait when contacting remote Git server
+    /// Seconds to wait when contacting remote update server
     #[arg(long, default_value_t = DEFAULT_FETCH_TIMEOUT_SEC)]
     update_timeout: f64,
 
-    /// Check remote Git repository for updates, print status, and exit
+    /// Check for updates, print status, and exit
     #[arg(long)]
     check_update: bool,
+
+    /// Do not automatically open Notflix in your default web browser on startup
+    #[arg(long)]
+    no_open: bool,
 }
 
 fn auto_update_enabled(cli_disabled: bool) -> bool {
@@ -83,19 +88,20 @@ fn init_tracing(quiet: bool) {
 fn maybe_run_startup_update(
     no_auto_update: bool,
     update_timeout: f64,
-    repo_dir: &Path,
     db_path: &Path,
 ) -> Option<UpdateResult> {
     if !auto_update_enabled(no_auto_update) {
         return None;
     }
-    let res = auto_update_on_startup(Some(repo_dir), Some(db_path), update_timeout);
+    let res = auto_update_on_startup(None, Some(db_path), update_timeout);
     if res.updated {
         println!("[updater] {}", res.message);
         if let Some(backup) = &res.backup_path {
             println!("[updater] Database backup saved to: {backup}");
         }
-        println!("[updater] Source updated. Rebuild or restart Notflix to load updated code.");
+        if res.branch.as_deref() != Some("release") {
+            println!("[updater] Source updated. Rebuild or restart Notflix to load updated code.");
+        }
     } else if matches!(
         res.status.as_str(),
         "offline" | "dirty" | "diverged" | "error"
@@ -109,21 +115,34 @@ fn maybe_run_startup_update(
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.quiet);
+    cleanup_old_binary_artifacts();
 
     let repo_dir = default_repo_dir();
     if cli.check_update {
-        let result = check_for_updates(Some(&repo_dir), cli.update_timeout);
+        let result = check_for_updates_with_fallback(&repo_dir, true, cli.update_timeout);
         println!("[{}] {}", result.status, result.message);
         return ExitCode::SUCCESS;
     }
 
     let resolved_db = cli.db.unwrap_or_else(default_db_path);
-    let startup_update = maybe_run_startup_update(
-        cli.no_auto_update,
-        cli.update_timeout,
-        &repo_dir,
-        &resolved_db,
-    );
+    let startup_update =
+        maybe_run_startup_update(cli.no_auto_update, cli.update_timeout, &resolved_db);
+
+    if let Some(ref res) = startup_update {
+        let already_relaunched = std::env::var("NOTFLIX_RELAUNCHED").ok().as_deref() == Some("1");
+        let exe_path = std::env::current_exe().unwrap_or_default();
+        if should_relaunch_after_startup_update(res, &exe_path, already_relaunched) {
+            println!("[updater] Launching updated Notflix binary...");
+            match relaunch_updated_binary() {
+                Ok(code) => return code,
+                Err(err) => {
+                    eprintln!(
+                        "[updater] Could not auto-relaunch updated binary ({err}); continuing with current process."
+                    );
+                }
+            }
+        }
+    }
 
     let store = match NotflixStore::new(Some(resolved_db)) {
         Ok(s) => s,
@@ -144,18 +163,22 @@ async fn main() -> ExitCode {
     let actual_addr: SocketAddr = listener
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], cli.port)));
+    let url = format!("http://{actual_addr}");
 
-    println!("Notflix is running at http://{actual_addr}");
+    println!("Notflix is running at {url}");
     println!("Database: {}", store.db_path().display());
     println!("Press Ctrl+C to stop.");
 
-    let state = AppState::new(
-        store,
-        cli.static_dir,
-        Some(repo_dir),
-        startup_update,
-        cli.quiet,
-    );
+    if !cli.no_open && std::env::var("NOTFLIX_NO_OPEN").ok().as_deref() != Some("1") {
+        let browser_url = if cli.host == "0.0.0.0" || cli.host == "::" {
+            format!("http://127.0.0.1:{}", actual_addr.port())
+        } else {
+            url
+        };
+        notflix::open_browser(&browser_url);
+    }
+
+    let state = AppState::new(store, cli.static_dir, None, startup_update, cli.quiet);
     let app = build_router(state);
 
     if let Err(err) = axum::serve(listener, app)

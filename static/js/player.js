@@ -1,6 +1,22 @@
-import { ICONS, PLAYBACK_SPEEDS, api, byId, formatTime, hasValidIntro, showToast } from "./utils.js";
+import {
+  ICONS,
+  PLAYBACK_SPEEDS,
+  api,
+  byId,
+  formatTime,
+  hasValidIntro,
+  hasValidOutro,
+  showToast,
+} from "./utils.js";
 import { describeEpisodePosition, findGroupKeyForEpisode } from "./seasons.js";
-import { getEpisodeById, setLinkedList, state, updateEpisodeInState } from "./state.js";
+import {
+  getEffectiveDuration,
+  getEffectiveTime,
+  getEpisodeById,
+  setLinkedList,
+  state,
+  updateEpisodeInState,
+} from "./state.js";
 import {
   refreshIntroUI,
   runIntroDetection,
@@ -10,11 +26,288 @@ import {
 } from "./intro.js";
 import { renderSeasonSidebar, resetSidebarFilters } from "./sidebar.js";
 
+const SUBTITLE_PREF_KEY = "notflix.subtitles";
+
 let callbacks = {
   onBackToLibrary: async () => {},
   isAnyModalOpen: () => false,
   closeOpenModal: () => false,
 };
+
+function readSubtitlePref() {
+  try {
+    const raw = localStorage.getItem(SUBTITLE_PREF_KEY);
+    if (!raw) return { enabled: false, lang: "" };
+    const parsed = JSON.parse(raw);
+    return {
+      enabled: Boolean(parsed?.enabled),
+      lang: typeof parsed?.lang === "string" ? parsed.lang : "",
+    };
+  } catch {
+    return { enabled: false, lang: "" };
+  }
+}
+
+function saveSubtitlePref(enabled, lang = "") {
+  try {
+    localStorage.setItem(SUBTITLE_PREF_KEY, JSON.stringify({ enabled: Boolean(enabled), lang: lang || "" }));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function syncSubtitleTrackModes() {
+  const video = byId("videoPlayer");
+  const tracks = video.textTracks;
+  if (tracks) {
+    for (let i = 0; i < tracks.length; i++) {
+      tracks[i].mode = i === state.activeSubtitleIndex ? "showing" : "disabled";
+    }
+  }
+  const btn = byId("ctrlSubBtn");
+  if (!btn) return;
+  const hasSubs = state.subtitleTracks.length > 0;
+  btn.classList.toggle("hidden", !hasSubs);
+  const enabled = hasSubs && state.activeSubtitleIndex >= 0;
+  btn.classList.toggle("active", enabled);
+  btn.classList.toggle("is-on", enabled);
+  if (enabled) {
+    const t = state.subtitleTracks[state.activeSubtitleIndex];
+    btn.title = `Subtitles: ${t?.label || "On"} (C)`;
+  } else {
+    btn.title = "Subtitles: Off (C)";
+  }
+}
+
+function updateAudioButtonUI() {
+  const btn = byId("ctrlAudioBtn");
+  if (!btn) return;
+  const showBtn = state.audioTracks.length > 1 || state.needsRemuxHint || state.remuxMode;
+  btn.classList.toggle("hidden", !showBtn);
+  btn.classList.toggle("active", state.remuxMode);
+  btn.classList.toggle("is-on", state.remuxMode);
+  if (!showBtn) return;
+
+  const currentTrack =
+    state.audioTracks.find((t) => t.index === state.activeAudioIndex) || state.audioTracks[0];
+  if (state.audioTracks.length > 1 && currentTrack) {
+    const shortLang = (currentTrack.language || `T${currentTrack.index + 1}`).toUpperCase().slice(0, 6);
+    btn.textContent = `♪ ${shortLang}`;
+    const desc = currentTrack.title || currentTrack.language || `Track ${currentTrack.index + 1}`;
+    btn.title = `Audio: ${desc} (${(currentTrack.codec || "").toUpperCase()}) — click to switch`;
+  } else if (state.remuxMode) {
+    btn.textContent = "♪ Remux";
+    btn.title = "Playing via ffmpeg remux — click to return to direct stream";
+  } else {
+    btn.textContent = "♪ Remux";
+    btn.title = "Incompatible audio codec detected — click to remux with ffmpeg";
+  }
+}
+
+function clearVideoSubtitles() {
+  const video = byId("videoPlayer");
+  for (const el of video.querySelectorAll("track")) {
+    el.remove();
+  }
+  state.subtitleTracks = [];
+  state.activeSubtitleIndex = -1;
+  syncSubtitleTrackModes();
+}
+
+async function loadEpisodeTracks(episodeId, token) {
+  try {
+    const data = await api(`/api/episodes/${episodeId}/tracks`);
+    if (token !== state.tracksRequestToken || state.currentEpisode?.id !== episodeId) return;
+
+    const subtitles = Array.isArray(data.subtitles) ? data.subtitles : [];
+    const audio = Array.isArray(data.audio) ? data.audio : [];
+    state.subtitleTracks = subtitles;
+    state.audioTracks = audio;
+    state.needsRemuxHint = Boolean(data.needs_remux_hint);
+    if (audio.length > 0 && !audio.some((t) => t.index === state.activeAudioIndex)) {
+      state.activeAudioIndex = audio[0].index;
+    }
+
+    const video = byId("videoPlayer");
+    for (const old of video.querySelectorAll("track")) old.remove();
+    for (const t of subtitles) {
+      const tr = document.createElement("track");
+      tr.kind = "subtitles";
+      tr.label = t.label || t.lang || `Track ${t.index + 1}`;
+      tr.srclang = t.lang || "und";
+      tr.src = `/api/episodes/${episodeId}/subtitles/${t.index}`;
+      video.appendChild(tr);
+    }
+
+    const pref = readSubtitlePref();
+    if (pref.enabled && subtitles.length > 0) {
+      let idx = -1;
+      if (pref.lang) {
+        const wanted = pref.lang.toLowerCase();
+        idx = subtitles.findIndex((t) => (t.lang || "").toLowerCase() === wanted);
+      }
+      state.activeSubtitleIndex = idx >= 0 ? idx : 0;
+    } else {
+      state.activeSubtitleIndex = -1;
+    }
+
+    syncSubtitleTrackModes();
+    updateAudioButtonUI();
+  } catch {
+    // Non-fatal: tracks endpoint failure should not disrupt playback
+  }
+}
+
+function cycleSubtitles({ fromKeyboard = false } = {}) {
+  if (state.subtitleTracks.length === 0) {
+    if (fromKeyboard) showToast("No subtitles available for this episode");
+    return;
+  }
+  if (state.activeSubtitleIndex < 0) {
+    state.activeSubtitleIndex = 0;
+  } else if (state.activeSubtitleIndex + 1 < state.subtitleTracks.length) {
+    state.activeSubtitleIndex += 1;
+  } else {
+    state.activeSubtitleIndex = -1;
+  }
+
+  syncSubtitleTrackModes();
+  if (state.activeSubtitleIndex >= 0) {
+    const track = state.subtitleTracks[state.activeSubtitleIndex];
+    const label = track.label || track.lang || `Track ${track.index + 1}`;
+    saveSubtitlePref(true, track.lang || "");
+    showToast(`Subtitles: ${label}`);
+  } else {
+    saveSubtitlePref(false, "");
+    showToast("Subtitles: Off");
+  }
+}
+
+async function startRemuxStream(ep, startSec = 0, audioIdx = 0, { autoPlay = true } = {}) {
+  if (!ep) return false;
+  const offset = Math.max(0, Math.floor(Number.isFinite(startSec) ? startSec : 0));
+  const url = `/api/episodes/${ep.id}/stream?remux=1&start=${offset}&audio=${audioIdx}`;
+
+  if (!state.ffmpegAvailable) {
+    const controller = new AbortController();
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      if (res.status === 501) {
+        const data = await res.json().catch(() => ({}));
+        showToast(data.error || "Remux unavailable: ffmpeg is not installed on the server.");
+        return false;
+      }
+      controller.abort();
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        showToast(data.error || `Remux failed (${res.status})`);
+        return false;
+      }
+      state.ffmpegAvailable = true;
+    } catch (err) {
+      if (err?.name !== "AbortError") {
+        showToast(`Remux unavailable: ${err.message}`);
+        return false;
+      }
+    }
+  }
+
+  const video = byId("videoPlayer");
+  state.remuxMode = true;
+  state.remuxOffsetSec = offset;
+  state.activeAudioIndex = audioIdx;
+  state.pendingSeekSec = null;
+  state.pendingRemuxSeekSec = null;
+  state.autoPlayOnLoad = autoPlay;
+
+  byId("playerErrorBanner").classList.add("hidden");
+  video.pause();
+  video.src = url;
+  video.load();
+
+  updateAudioButtonUI();
+  updatePlayerControlsUI();
+  return true;
+}
+
+async function cycleAudioTrack() {
+  const ep = state.currentEpisode;
+  if (!ep) return;
+  const video = byId("videoPlayer");
+  const pos = getEffectiveTime(video);
+
+  if (state.audioTracks.length > 1) {
+    const curPos = state.audioTracks.findIndex((t) => t.index === state.activeAudioIndex);
+    const nextTrack = state.audioTracks[(curPos + 1) % state.audioTracks.length];
+    const ok = await startRemuxStream(ep, pos, nextTrack.index, { autoPlay: !video.paused || true });
+    if (ok) {
+      const desc = nextTrack.title || nextTrack.language || `Track ${nextTrack.index + 1}`;
+      const codec = nextTrack.codec ? ` (${nextTrack.codec.toUpperCase()})` : "";
+      showToast(`Audio: ${desc}${codec}`);
+    }
+    return;
+  }
+
+  if (!state.remuxMode) {
+    const audioIdx = state.audioTracks[0]?.index ?? 0;
+    const ok = await startRemuxStream(ep, pos, audioIdx, { autoPlay: true });
+    if (ok) showToast("Remuxing audio stream for browser playback");
+  } else {
+    state.remuxMode = false;
+    state.remuxOffsetSec = 0;
+    state.pendingSeekSec = pos;
+    state.autoPlayOnLoad = true;
+    byId("playerErrorBanner").classList.add("hidden");
+    video.pause();
+    video.src = `/api/episodes/${ep.id}/stream`;
+    video.load();
+    updateAudioButtonUI();
+    showToast("Switched back to direct stream");
+  }
+}
+
+export function seekToTime(targetSec, { autoPlay = null } = {}) {
+  const video = byId("videoPlayer");
+  const dur = getEffectiveDuration(video);
+  const clamped = dur > 0 ? Math.max(0, Math.min(dur - 0.25, targetSec)) : Math.max(0, targetSec);
+  if (state.remuxMode && state.currentEpisode) {
+    const shouldPlay = autoPlay !== null ? autoPlay : !video.paused;
+    startRemuxStream(state.currentEpisode, clamped, state.activeAudioIndex, { autoPlay: shouldPlay });
+    return;
+  }
+  video.currentTime = clamped;
+  if (autoPlay === true) {
+    video.play().catch(() => {});
+  }
+  updatePlayerControlsUI();
+  updateSkipIntroVisibility();
+}
+
+function attachEpisodeThumbnails() {
+  const list = byId("episodeList");
+  if (!list) return;
+  for (const card of list.querySelectorAll(".ep-row-card[data-select-ep]")) {
+    const epId = card.dataset.selectEp;
+    const main = card.querySelector(".ep-row-main");
+    if (!epId || !main || main.querySelector(".ep-thumb")) continue;
+    const img = document.createElement("img");
+    img.className = "ep-thumb";
+    img.src = `/api/episodes/${epId}/thumbnail`;
+    img.alt = "";
+    img.loading = "lazy";
+    img.addEventListener("load", () => img.classList.add("loaded"), { once: true });
+    img.addEventListener("error", () => img.remove(), { once: true });
+    main.insertBefore(img, main.firstChild);
+  }
+}
+
+function installEpisodeThumbnailObserver() {
+  const list = byId("episodeList");
+  if (!list || typeof MutationObserver === "undefined") return;
+  const observer = new MutationObserver(() => attachEpisodeThumbnails());
+  observer.observe(list, { childList: true });
+  attachEpisodeThumbnails();
+}
 
 export function setView(viewName) {
   state.view = viewName;
@@ -87,6 +380,14 @@ export function loadEpisode(episode, { autoPlay = true, forceStartZero = false }
   state.currentEpisode = canonical;
   state.upNextDismissedFor = null;
   state.autoPlayOnLoad = autoPlay;
+  state.remuxMode = false;
+  state.remuxOffsetSec = 0;
+  state.pendingRemuxSeekSec = null;
+  state.audioTracks = [];
+  state.activeAudioIndex = 0;
+  state.needsRemuxHint = false;
+  clearVideoSubtitles();
+  updateAudioButtonUI();
 
   // Auto-follow the playing episode's season group
   const targetGroupKey = findGroupKeyForEpisode(state.episodeGroups, canonical.id);
@@ -132,6 +433,9 @@ export function loadEpisode(episode, { autoPlay = true, forceStartZero = false }
   videoPlayer.pause();
   videoPlayer.src = `/api/episodes/${canonical.id}/stream`;
   videoPlayer.load();
+
+  const tracksToken = ++state.tracksRequestToken;
+  loadEpisodeTracks(canonical.id, tracksToken);
 
   refreshIntroUI();
   updatePlayerControlsUI();
@@ -243,8 +547,11 @@ function cyclePlaybackSpeed() {
 
 export function updatePlayerControlsUI() {
   const v = byId("videoPlayer");
-  const dur = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
-  const cur = Number.isFinite(v.currentTime) ? v.currentTime : 0;
+  const dur = getEffectiveDuration(v);
+  const cur =
+    state.isSeeking && state.remuxMode && state.pendingRemuxSeekSec !== null
+      ? state.pendingRemuxSeekSec
+      : getEffectiveTime(v);
   const pct = dur > 0 ? Math.max(0, Math.min(100, (cur / dur) * 100)) : 0;
 
   byId("ctrlPlayBtn").innerHTML = v.paused ? ICONS.play : ICONS.pause;
@@ -255,7 +562,7 @@ export function updatePlayerControlsUI() {
 
   const seekBuffered = byId("seekBuffered");
   if (dur > 0 && v.buffered && v.buffered.length > 0) {
-    const bufEnd = v.buffered.end(v.buffered.length - 1);
+    const bufEnd = (state.remuxMode ? state.remuxOffsetSec : 0) + v.buffered.end(v.buffered.length - 1);
     seekBuffered.style.width = `${Math.max(0, Math.min(100, (bufEnd / dur) * 100))}%`;
   } else {
     seekBuffered.style.width = "0%";
@@ -270,13 +577,24 @@ export function updatePlayerControlsUI() {
   byId("ctrlFullscreenBtn").innerHTML = isStageFullscreen() ? ICONS.fsExit : ICONS.fsEnter;
 }
 
-function seekFromClientX(clientX) {
+function seekFromClientX(clientX, { commit = true } = {}) {
   const video = byId("videoPlayer");
-  const dur = video.duration;
+  const dur = getEffectiveDuration(video);
   if (!Number.isFinite(dur) || dur <= 0) return;
   const rect = byId("seekBar").getBoundingClientRect();
   const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-  video.currentTime = ratio * dur;
+  const targetSec = ratio * dur;
+  if (state.remuxMode) {
+    state.pendingRemuxSeekSec = targetSec;
+    updatePlayerControlsUI();
+    if (commit) {
+      const target = state.pendingRemuxSeekSec;
+      state.pendingRemuxSeekSec = null;
+      seekToTime(target);
+    }
+    return;
+  }
+  video.currentTime = targetSec;
   updatePlayerControlsUI();
   updateSkipIntroVisibility();
 }
@@ -290,11 +608,11 @@ export async function saveCurrentProgress({ immediate = false, watched = null, u
   if (!immediate && now - state.lastSavedAt < 4500) return;
 
   const video = byId("videoPlayer");
-  const pos = Number.isFinite(video.currentTime) ? video.currentTime : ep.position_sec;
-  const dur = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : ep.duration_sec;
+  const pos = getEffectiveTime(video);
+  const dur = getEffectiveDuration(video);
 
   const payload = {
-    position_sec: Math.max(0, pos),
+    position_sec: Math.max(0, Number.isFinite(pos) ? pos : ep.position_sec),
     duration_sec: dur > 0 ? dur : null,
   };
   if (watched !== null) payload.watched = watched;
@@ -379,12 +697,13 @@ function bindVideoEvents() {
   video.addEventListener("playing", () => spinner.classList.add("hidden"));
 
   video.addEventListener("loadedmetadata", () => {
-    if (state.pendingSeekSec !== null && state.pendingSeekSec > 0) {
+    if (!state.remuxMode && state.pendingSeekSec !== null && state.pendingSeekSec > 0) {
       const maxSeek = Math.max(0, (video.duration || state.pendingSeekSec) - 0.5);
       video.currentTime = Math.min(state.pendingSeekSec, maxSeek);
     }
     state.pendingSeekSec = null;
 
+    syncSubtitleTrackModes();
     updateSeekIntroHighlight();
     updateSkipIntroVisibility();
     updatePlayerControlsUI();
@@ -400,14 +719,17 @@ function bindVideoEvents() {
     saveCurrentProgress({ immediate: false });
     updatePlayerControlsUI();
 
-    const dur = video.duration;
-    const cur = video.currentTime;
+    const dur = getEffectiveDuration(video);
+    const cur = getEffectiveTime(video);
     const ep = state.currentEpisode;
-    if (ep && ep.next_id && Number.isFinite(dur) && dur > 20) {
-      const remaining = dur - cur;
-      if (remaining <= 15 && state.upNextDismissedFor !== ep.id) {
+    if (ep && ep.next_id && Number.isFinite(dur) && dur > 0) {
+      const hasOutro = hasValidOutro(ep, dur);
+      const shouldShowUpNext = hasOutro ? cur >= ep.outro_start_sec : dur > 45 && dur - cur <= 15;
+      const shouldHideUpNext = hasOutro ? cur < ep.outro_start_sec - 1 : dur - cur > 16;
+
+      if (shouldShowUpNext && state.upNextDismissedFor !== ep.id) {
         upNextCard.classList.remove("hidden");
-      } else if (remaining > 16) {
+      } else if (shouldHideUpNext) {
         upNextCard.classList.add("hidden");
         cancelAutoplayCountdown();
       }
@@ -503,9 +825,19 @@ function bindCinemaControls() {
   });
 
   byId("restartEpBtn").addEventListener("click", () => {
-    video.currentTime = 0;
+    seekToTime(0, { autoPlay: true });
     saveCurrentProgress({ immediate: true });
-    video.play().catch(() => {});
+  });
+
+  byId("btnFixAudioRemux")?.addEventListener("click", async () => {
+    const ep = state.currentEpisode;
+    if (!ep) return;
+    const pos = getEffectiveTime(video) || ep.position_sec || 0;
+    const audioIdx = state.audioTracks[0]?.index ?? state.activeAudioIndex ?? 0;
+    const ok = await startRemuxStream(ep, pos, audioIdx, { autoPlay: true });
+    if (ok) {
+      showToast("Reloading episode via ffmpeg remux…");
+    }
   });
 
   video.addEventListener("click", () => {
@@ -534,6 +866,7 @@ function bindCinemaControls() {
 
   const bindCtrlBtn = (id, fn) => {
     const btn = byId(id);
+    if (!btn) return;
     btn.addEventListener("click", () => {
       btn.blur();
       fn();
@@ -542,14 +875,23 @@ function bindCinemaControls() {
 
   bindCtrlBtn("ctrlPlayBtn", togglePlayPause);
   bindCtrlBtn("ctrlBackBtn", () => {
-    video.currentTime = Math.max(0, video.currentTime - 10);
+    seekToTime(Math.max(0, getEffectiveTime(video) - 10));
     showControlsTemporarily();
   });
   bindCtrlBtn("ctrlFwdBtn", () => {
-    video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 10);
+    const dur = getEffectiveDuration(video);
+    seekToTime(Math.min(dur || Infinity, getEffectiveTime(video) + 10));
     showControlsTemporarily();
   });
   bindCtrlBtn("ctrlMuteBtn", toggleMute);
+  bindCtrlBtn("ctrlSubBtn", () => {
+    cycleSubtitles({ fromKeyboard: false });
+    showControlsTemporarily();
+  });
+  bindCtrlBtn("ctrlAudioBtn", () => {
+    cycleAudioTrack();
+    showControlsTemporarily();
+  });
   bindCtrlBtn("ctrlSpeedBtn", cyclePlaybackSpeed);
   bindCtrlBtn("ctrlAutoplayBtn", () => {
     state.autoplayNext = !state.autoplayNext;
@@ -588,11 +930,11 @@ function bindCinemaControls() {
     state.isSeeking = true;
     seekBar.classList.add("dragging");
     seekBar.setPointerCapture?.(ev.pointerId);
-    seekFromClientX(ev.clientX);
+    seekFromClientX(ev.clientX, { commit: !state.remuxMode });
   });
 
   seekBar.addEventListener("pointermove", (ev) => {
-    const dur = video.duration;
+    const dur = getEffectiveDuration(video);
     const rect = seekBar.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
     if (Number.isFinite(dur) && dur > 0) {
@@ -602,13 +944,16 @@ function bindCinemaControls() {
       const ep = state.currentEpisode;
       const inHoverIntro =
         hasValidIntro(ep) && hoverSec >= ep.intro_start_sec && hoverSec <= ep.intro_end_sec;
+      const inHoverOutro = hasValidOutro(ep, dur) && hoverSec >= ep.outro_start_sec;
       seekHoverTip.textContent = inHoverIntro
         ? `${formatTime(hoverSec)} · Intro`
+        : inHoverOutro
+        ? `${formatTime(hoverSec)} · Credits`
         : formatTime(hoverSec);
       seekHoverTip.classList.remove("hidden");
     }
     if (state.isSeeking) {
-      seekFromClientX(ev.clientX);
+      seekFromClientX(ev.clientX, { commit: false });
     }
   });
 
@@ -617,6 +962,11 @@ function bindCinemaControls() {
     state.isSeeking = false;
     seekBar.classList.remove("dragging");
     seekBar.releasePointerCapture?.(ev.pointerId);
+    if (state.remuxMode && state.pendingRemuxSeekSec !== null) {
+      const target = state.pendingRemuxSeekSec;
+      state.pendingRemuxSeekSec = null;
+      seekToTime(target);
+    }
     saveCurrentProgress({ immediate: true });
     showControlsTemporarily();
   });
@@ -666,11 +1016,12 @@ function bindKeyboardShortcuts() {
       togglePlayPause();
     } else if (ev.key === "ArrowRight") {
       ev.preventDefault();
-      video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 10);
+      const dur = getEffectiveDuration(video);
+      seekToTime(Math.min(dur || Infinity, getEffectiveTime(video) + 10));
       showControlsTemporarily();
     } else if (ev.key === "ArrowLeft") {
       ev.preventDefault();
-      video.currentTime = Math.max(0, video.currentTime - 10);
+      seekToTime(Math.max(0, getEffectiveTime(video) - 10));
       showControlsTemporarily();
     } else if (ev.key === "ArrowUp") {
       ev.preventDefault();
@@ -686,6 +1037,10 @@ function bindKeyboardShortcuts() {
         ev.preventDefault();
         skipIntro();
       }
+    } else if (ev.key === "c" || ev.key === "C") {
+      ev.preventDefault();
+      cycleSubtitles({ fromKeyboard: true });
+      showControlsTemporarily();
     } else if (ev.key === "m" || ev.key === "M") {
       ev.preventDefault();
       toggleMute();
@@ -697,7 +1052,7 @@ function bindKeyboardShortcuts() {
       goPrevEpisode();
     } else if (ev.key === "r" || ev.key === "R") {
       ev.preventDefault();
-      video.currentTime = 0;
+      seekToTime(0);
       saveCurrentProgress({ immediate: true });
     } else if (ev.key === "f" || ev.key === "F") {
       ev.preventDefault();
@@ -711,4 +1066,5 @@ export function initPlayer(hooks = {}) {
   bindVideoEvents();
   bindCinemaControls();
   bindKeyboardShortcuts();
+  installEpisodeThumbnailObserver();
 }

@@ -20,6 +20,20 @@ static INTRO_CHAPTER_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("INTRO_CHAPTER_RE must be a valid regular expression")
 });
 
+static OUTRO_CHAPTER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)",
+        r"(?:^|[\s\-_:/(\[])",
+        r"(?:(?:end|closing)[\s\-_]+(?:credits?|titles?|theme)|credits?|",
+        r"ending(?:[\s\-_]+(?:credits?|titles?|theme|sequence))?|",
+        r"closing(?:[\s\-_]+(?:credits?|titles?|theme|sequence))?|",
+        r"outro|ed(?:\s*\d+)?|",
+        r"next[\s\-_]+(?:time|episode)|preview|epilogue)",
+        r"(?:$|[\s\-_:/)\]])",
+    ))
+    .expect("OUTRO_CHAPTER_RE must be a valid regular expression")
+});
+
 // Matroska / EBML element IDs
 const EBML_HEADER_MAGIC: [u8; 4] = [0x1a, 0x45, 0xdf, 0xa3];
 const EBML_SEGMENT_ID: u64 = 0x1853_8067;
@@ -52,6 +66,24 @@ pub struct ChapterMarker {
 /// Return `true` if a chapter title explicitly labels an intro/opening sequence.
 pub fn is_intro_chapter_title(title: &str) -> bool {
     !title.is_empty() && INTRO_CHAPTER_RE.is_match(title)
+}
+
+/// Return `true` if a chapter title explicitly labels an outro, end credits, or preview.
+pub fn is_outro_chapter_title(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("opening")
+        || lower.contains("intro")
+        || lower.contains("cold open")
+        || lower.contains("cold-open")
+        || lower.contains("cold_open")
+    {
+        return false;
+    }
+    OUTRO_CHAPTER_RE.is_match(trimmed)
 }
 
 /// Determine EBML VINT byte length from its leading byte (`0` if invalid).
@@ -547,4 +579,55 @@ pub fn detect_intro_from_chapters(
         });
     }
     None
+}
+
+/// Return an `IntroSpan` if chapter markers explicitly label an outro/credits section
+/// in the latter portion of the episode.
+pub fn detect_outro_from_chapters(
+    chapters: &[ChapterMarker],
+    duration_sec: f64,
+) -> Option<IntroSpan> {
+    if chapters.is_empty() {
+        return None;
+    }
+
+    let eff_dur = if duration_sec.is_finite() && duration_sec > 0.0 {
+        duration_sec
+    } else {
+        chapters
+            .iter()
+            .filter_map(|ch| ch.end_sec)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .fold(0.0_f64, f64::max)
+    };
+
+    let earliest = chapters
+        .iter()
+        .filter(|ch| {
+            if !is_outro_chapter_title(&ch.title) {
+                return false;
+            }
+            if !ch.start_sec.is_finite() || ch.start_sec < 0.0 {
+                return false;
+            }
+            if ch.start_sec < eff_dur * 0.55 {
+                return false;
+            }
+            if eff_dur > 0.0 && ch.start_sec >= eff_dur - 2.0 {
+                return false;
+            }
+            true
+        })
+        .min_by(|a, b| a.start_sec.total_cmp(&b.start_sec))?;
+
+    let end_sec = eff_dur
+        .max(earliest.end_sec.unwrap_or(0.0))
+        .max(earliest.start_sec);
+
+    Some(IntroSpan {
+        start_sec: earliest.start_sec,
+        end_sec,
+        confidence: 0.96,
+        source: "chapter".to_string(),
+    })
 }

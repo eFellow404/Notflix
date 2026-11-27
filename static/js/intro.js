@@ -1,9 +1,25 @@
-import { api, byId, formatTime, hasValidIntro, parseTimeInput, showToast } from "./utils.js";
-import { getEpisodeById, setLinkedList, state, updateEpisodeInState } from "./state.js";
+import {
+  api,
+  byId,
+  formatTime,
+  hasValidIntro,
+  hasValidOutro,
+  parseTimeInput,
+  showToast,
+} from "./utils.js";
+import {
+  getEffectiveDuration,
+  getEffectiveTime,
+  getEpisodeById,
+  setLinkedList,
+  state,
+  updateEpisodeInState,
+} from "./state.js";
 
 let callbacks = {
   onIntroUpdated: () => {},
   onAfterSkipIntro: () => {},
+  onSeekTo: null,
 };
 
 const INTRO_SOURCE_LABELS = {
@@ -16,17 +32,31 @@ const INTRO_SOURCE_LABELS = {
 export function updateSeekIntroHighlight() {
   const ep = state.currentEpisode;
   const seekIntroRange = byId("seekIntroRange");
-  const dur = byId("videoPlayer").duration;
+  const seekOutroMarker = byId("seekOutroMarker");
+  const dur = getEffectiveDuration(byId("videoPlayer"));
+
   if (!hasValidIntro(ep) || !Number.isFinite(dur) || dur <= 0) {
     seekIntroRange.classList.add("hidden");
-    return;
+  } else {
+    const startPct = Math.max(0, Math.min(100, (ep.intro_start_sec / dur) * 100));
+    const endPct = Math.max(startPct, Math.min(100, (ep.intro_end_sec / dur) * 100));
+    seekIntroRange.style.left = `${startPct}%`;
+    seekIntroRange.style.width = `${Math.max(0.6, endPct - startPct)}%`;
+    seekIntroRange.title = `Intro: ${formatTime(ep.intro_start_sec)} – ${formatTime(ep.intro_end_sec)}`;
+    seekIntroRange.classList.remove("hidden");
   }
-  const startPct = Math.max(0, Math.min(100, (ep.intro_start_sec / dur) * 100));
-  const endPct = Math.max(startPct, Math.min(100, (ep.intro_end_sec / dur) * 100));
-  seekIntroRange.style.left = `${startPct}%`;
-  seekIntroRange.style.width = `${Math.max(0.6, endPct - startPct)}%`;
-  seekIntroRange.title = `Intro: ${formatTime(ep.intro_start_sec)} – ${formatTime(ep.intro_end_sec)}`;
-  seekIntroRange.classList.remove("hidden");
+
+  if (seekOutroMarker) {
+    if (hasValidOutro(ep, dur) && Number.isFinite(dur) && dur > 0) {
+      const outroPct = Math.max(0, Math.min(100, (ep.outro_start_sec / dur) * 100));
+      seekOutroMarker.style.left = `${outroPct}%`;
+      seekOutroMarker.style.width = `${Math.max(0.5, 100 - outroPct)}%`;
+      seekOutroMarker.title = `Credits / Outro: ${formatTime(ep.outro_start_sec)}`;
+      seekOutroMarker.classList.remove("hidden");
+    } else {
+      seekOutroMarker.classList.add("hidden");
+    }
+  }
 }
 
 export function updateSkipIntroVisibility() {
@@ -37,7 +67,7 @@ export function updateSkipIntroVisibility() {
     skipIntroOverlay.classList.add("hidden");
     return;
   }
-  const cur = byId("videoPlayer").currentTime;
+  const cur = getEffectiveTime(byId("videoPlayer"));
   const inIntro =
     Number.isFinite(cur) &&
     cur >= ep.intro_start_sec &&
@@ -55,12 +85,17 @@ export function skipIntro() {
   const ep = state.currentEpisode;
   if (!hasValidIntro(ep)) return;
   const video = byId("videoPlayer");
-  const dur = video.duration;
+  const dur = getEffectiveDuration(video);
   const target =
     Number.isFinite(dur) && dur > 1
       ? Math.min(ep.intro_end_sec, dur - 0.5)
       : ep.intro_end_sec;
-  video.currentTime = Math.max(0, target);
+  const clamped = Math.max(0, target);
+  if (callbacks.onSeekTo) {
+    callbacks.onSeekTo(clamped);
+  } else {
+    video.currentTime = clamped;
+  }
   updateSkipIntroVisibility();
   callbacks.onAfterSkipIntro();
 }
@@ -191,16 +226,10 @@ export async function extractVisualFingerprint(episode, isCancelled) {
       const cropW = vw > 0 ? Math.max(1, vw - cropX * 2) : 0;
       const cropH = vh > 0 ? Math.max(1, vh - cropY * 2) : 0;
 
-      for (let t = 0; t < scanLimit; t += step) {
-        if (isCancelled()) {
-          cleanup(null);
-          return;
-        }
+      const sampleFrame = async (t) => {
         const ok = await seekTo(t);
         if (!ok || !ctx) {
-          vectors.push(new Array(VEC_LEN).fill(0));
-          flatFlags.push(true);
-          continue;
+          return { vec: new Array(VEC_LEN).fill(0), isFlat: true };
         }
         try {
           if (cropW > 0 && cropH > 0) {
@@ -224,11 +253,46 @@ export async function extractVisualFingerprint(episode, isCancelled) {
             const d = vec[k] - mean;
             varSum += d * d;
           }
-          vectors.push(vec);
-          flatFlags.push(Math.sqrt(varSum / vec.length) < 8.0);
+          return { vec, isFlat: Math.sqrt(varSum / vec.length) < 8.0 };
         } catch {
-          vectors.push(new Array(VEC_LEN).fill(0));
-          flatFlags.push(true);
+          return { vec: new Array(VEC_LEN).fill(0), isFlat: true };
+        }
+      };
+
+      for (let t = 0; t < scanLimit; t += step) {
+        if (isCancelled()) {
+          cleanup(null);
+          return;
+        }
+        const { vec, isFlat } = await sampleFrame(t);
+        vectors.push(vec);
+        flatFlags.push(isFlat);
+      }
+
+      let tailFingerprint = null;
+      if (duration >= 240) {
+        const tailStep = 1.5;
+        const tailStart = Math.max(0, duration - 120);
+        const tailEnd = duration - 0.5;
+        const tailVectors = [];
+        const tailFlatFlags = [];
+        for (let t = tailStart; t < tailEnd; t += tailStep) {
+          if (isCancelled()) {
+            cleanup(null);
+            return;
+          }
+          const { vec, isFlat } = await sampleFrame(t);
+          tailVectors.push(vec);
+          tailFlatFlags.push(isFlat);
+        }
+        if (tailVectors.length > 0) {
+          tailFingerprint = {
+            episode_id: episode.id,
+            step_sec: tailStep,
+            vectors: tailVectors,
+            flat_flags: tailFlatFlags,
+            duration_sec: duration,
+          };
         }
       }
 
@@ -238,6 +302,7 @@ export async function extractVisualFingerprint(episode, isCancelled) {
         vectors,
         flat_flags: flatFlags,
         duration_sec: duration,
+        tailFingerprint,
       });
     };
 
@@ -270,6 +335,7 @@ export async function runBrowserVisualIntroScan(showId, { force = false, silent 
   }
   const targets = prioritized.slice(0, 24);
   const collected = [];
+  const collectedTails = [];
   const firstBatchSize = Math.min(4, targets.length);
 
   for (let i = 0; i < targets.length; i++) {
@@ -278,17 +344,25 @@ export async function runBrowserVisualIntroScan(showId, { force = false, silent 
     refreshIntroUI(`Scanning episodes (${i + 1}/${targets.length})…`);
     const fp = await extractVisualFingerprint(ep, isCancelled);
     if (isCancelled()) return;
-    if (fp) collected.push(fp);
+    if (fp) {
+      const { tailFingerprint, ...headFp } = fp;
+      collected.push(headFp);
+      if (tailFingerprint) collectedTails.push(tailFingerprint);
+    }
 
     if (i + 1 === firstBatchSize && targets.length > firstBatchSize && collected.length >= 2) {
       try {
+        const partialBody = {
+          fingerprints: collected,
+          force,
+          mark_scanned: false,
+        };
+        if (collectedTails.length >= 2) {
+          partialBody.tail_fingerprints = collectedTails;
+        }
         const partial = await api(`/api/shows/${showId}/detect-intros`, {
           method: "POST",
-          body: JSON.stringify({
-            fingerprints: collected,
-            force,
-            mark_scanned: false,
-          }),
+          body: JSON.stringify(partialBody),
         });
         if (isCancelled()) return;
         state.activeShow = partial.show;
@@ -308,13 +382,17 @@ export async function runBrowserVisualIntroScan(showId, { force = false, silent 
   }
 
   refreshIntroUI("Matching shared intro…");
+  const finalBody = {
+    fingerprints: collected,
+    force,
+    mark_scanned: true,
+  };
+  if (collectedTails.length >= 2) {
+    finalBody.tail_fingerprints = collectedTails;
+  }
   const finalRes = await api(`/api/shows/${showId}/detect-intros`, {
     method: "POST",
-    body: JSON.stringify({
-      fingerprints: collected,
-      force,
-      mark_scanned: true,
-    }),
+    body: JSON.stringify(finalBody),
   });
   if (isCancelled()) return;
 
@@ -433,12 +511,13 @@ export function initIntro(hooks = {}) {
     introEditorError.classList.add("hidden");
     if (willOpen && state.currentEpisode) {
       const ep = state.currentEpisode;
+      const curTime = getEffectiveTime(videoPlayer);
       introStartInput.value = hasValidIntro(ep)
         ? formatTime(ep.intro_start_sec)
-        : formatTime(videoPlayer.currentTime || 0);
+        : formatTime(curTime);
       introEndInput.value = hasValidIntro(ep)
         ? formatTime(ep.intro_end_sec)
-        : formatTime((videoPlayer.currentTime || 0) + 60);
+        : formatTime(curTime + 60);
       introStartInput.focus();
     }
   });
@@ -448,11 +527,11 @@ export function initIntro(hooks = {}) {
   });
 
   byId("markIntroStartBtn").addEventListener("click", () => {
-    introStartInput.value = formatTime(videoPlayer.currentTime || 0);
+    introStartInput.value = formatTime(getEffectiveTime(videoPlayer));
   });
 
   byId("markIntroEndBtn").addEventListener("click", () => {
-    introEndInput.value = formatTime(videoPlayer.currentTime || 0);
+    introEndInput.value = formatTime(getEffectiveTime(videoPlayer));
   });
 
   byId("saveIntroBtn").addEventListener("click", async () => {
@@ -464,8 +543,13 @@ export function initIntro(hooks = {}) {
     const ok = await saveManualIntro();
     if (!ok || !state.currentEpisode) return;
     const start = state.currentEpisode.intro_start_sec || 0;
-    videoPlayer.currentTime = Math.max(0, start - 2);
-    videoPlayer.play().catch(() => {});
+    const target = Math.max(0, start - 2);
+    if (callbacks.onSeekTo) {
+      callbacks.onSeekTo(target, { autoPlay: true });
+    } else {
+      videoPlayer.currentTime = target;
+      videoPlayer.play().catch(() => {});
+    }
     updateSkipIntroVisibility();
   });
 

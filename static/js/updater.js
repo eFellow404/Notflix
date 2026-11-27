@@ -24,15 +24,20 @@ function renderUpdateButton(info) {
   }
 
   if (info.status === "update_available") {
-    const count = info.behind_count || 1;
-    btn.textContent = `↑ Update (${count})`;
+    const label =
+      info.behind_count > 0
+        ? `↑ Update (${info.behind_count})`
+        : info.remote_short_sha
+        ? `↑ Update (${info.remote_short_sha})`
+        : "↑ Update";
+    btn.textContent = label;
     btn.title = `${info.message} Click to back up your database and update.`;
     btn.classList.add("btn-update-available");
     return;
   }
 
   btn.textContent = "↻ Updates";
-  btn.title = info.message || "Check remote Git repository for updates";
+  btn.title = info.message || "Check for updates";
 }
 
 async function handleUpdateClick() {

@@ -56,6 +56,14 @@ export function hasValidIntro(ep) {
   );
 }
 
+export function hasValidOutro(ep, duration = 0) {
+  if (!ep || ep.outro_start_sec === null || ep.outro_start_sec === undefined) return false;
+  if (!Number.isFinite(ep.outro_start_sec) || ep.outro_start_sec <= 30) return false;
+  const dur = duration > 0 ? duration : ep.duration_sec || 0;
+  if (dur > 0 && ep.outro_start_sec >= dur - 2) return false;
+  return true;
+}
+
 export function escapeHtml(str) {
   return String(str ?? "")
     .replace(/&/g, "&amp;")

@@ -17,6 +17,8 @@ const GOERTZEL_FREQS: [f64; 16] = [
     1450.0, 1700.0, 1900.0,
 ];
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(45);
+const TAIL_FFMPEG_TIMEOUT: Duration = Duration::from_secs(15);
+const TAIL_FFMPEG_SAMPLE_RATE: usize = 8000;
 
 static GOERTZEL_COEFFS: LazyLock<[f64; 16]> = LazyLock::new(|| {
     let mut coeffs = [0.0; 16];
@@ -188,4 +190,72 @@ pub fn extract_audio_fingerprint(
         .collect();
 
     extract_audio_fingerprint_from_pcm(&pcm, episode_id, step_sec)
+}
+
+/// Extract compact spectral audio fingerprints from the trailing `tail_sec` seconds of an episode.
+///
+/// Decodes mono 8 kHz s16le PCM via `ffmpeg -sseof`, downsamples 2:1 to the 4 kHz Goertzel
+/// analysis rate, and records the full episode `duration_sec` on the resulting fingerprint so
+/// tail offsets can be mapped back to absolute timestamps.
+pub fn extract_tail_audio_fingerprint(
+    file_path: &Path,
+    episode_id: &str,
+    duration_sec: f64,
+    tail_sec: f64,
+    step_sec: f64,
+) -> Option<EpisodeFingerprint> {
+    if !tail_sec.is_finite() || tail_sec <= 0.0 {
+        return None;
+    }
+    let ffmpeg_bin = which::which("ffmpeg").ok()?;
+    if !file_path.exists() {
+        return None;
+    }
+
+    let sseof_arg = format!("-{tail_sec:.1}");
+    let sample_rate_str = TAIL_FFMPEG_SAMPLE_RATE.to_string();
+
+    let mut cmd = Command::new(ffmpeg_bin);
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-sseof",
+        &sseof_arg,
+        "-i",
+    ])
+    .arg(file_path)
+    .args([
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        &sample_rate_str,
+        "-f",
+        "s16le",
+        "pipe:1",
+    ]);
+
+    let outcome = run_command_with_timeout(&mut cmd, TAIL_FFMPEG_TIMEOUT, false);
+    if !outcome.success() || outcome.stdout.is_empty() {
+        return None;
+    }
+
+    // Downsample 8 kHz s16le PCM -> 4 kHz mono i16 (2-sample boxcar average) so
+    // Goertzel filter coefficients and step sizes align with `AUDIO_SAMPLE_RATE`.
+    let usable = outcome.stdout.len() - (outcome.stdout.len() % 4);
+    let pcm: Vec<i16> = outcome.stdout[..usable]
+        .chunks_exact(4)
+        .map(|chunk| {
+            let s0 = i32::from(i16::from_le_bytes([chunk[0], chunk[1]]));
+            let s1 = i32::from(i16::from_le_bytes([chunk[2], chunk[3]]));
+            ((s0 + s1) / 2) as i16
+        })
+        .collect();
+
+    let mut fp = extract_audio_fingerprint_from_pcm(&pcm, episode_id, step_sec)?;
+    if duration_sec.is_finite() && duration_sec > 0.0 {
+        fp.duration_sec = duration_sec;
+    }
+    Some(fp)
 }

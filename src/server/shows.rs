@@ -1,26 +1,30 @@
 //! Show management, episode navigation, intro detection, and filesystem browsing endpoints.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::StatusCode;
-use axum::response::Response;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::{NotflixError, Result};
 use crate::intelligence::is_video_extension;
 use crate::intro_detector::{
-    build_fingerprint, detect_show_intros_server, find_shared_intros_default, EpisodeFingerprint,
-    IntroSpan,
+    build_fingerprint, detect_show_intros_server, detect_show_outros_server,
+    find_shared_intros_default, find_shared_outros, EpisodeFingerprint, IntroSpan,
 };
 use crate::linked_list::EpisodeLinkedList;
-use crate::storage::NotflixStore;
+use crate::media::{find_show_poster, guess_image_mime};
+use crate::storage::{NotflixStore, WatchHistoryExport};
 use crate::util::{canonicalize_clean, expand_tilde_str};
 
-use super::{json_no_store, parse_json_object, run_blocking, value_as_trimmed_string, AppState};
+use super::{
+    json_no_store, parse_json_object, run_blocking, value_as_trimmed_string, AppState,
+    MAX_JSON_BODY_BYTES,
+};
 
 // ---------------------------------------------------------------------------
 // Filesystem Browser Endpoint
@@ -477,17 +481,21 @@ fn parse_client_fingerprints(
     parsed
 }
 
-fn run_server_intro_pass(ll: &EpisodeLinkedList) -> IntroDetectionPass {
+fn episode_detection_inputs(ll: &EpisodeLinkedList) -> Vec<(String, PathBuf, f64)> {
     let non_extras: Vec<_> = ll.iter().filter(|n| !n.is_extra).collect();
     let targets = if non_extras.len() >= 2 {
         non_extras
     } else {
         ll.iter().collect()
     };
-    let ep_specs: Vec<(String, PathBuf, f64)> = targets
+    targets
         .into_iter()
         .map(|n| (n.id.clone(), PathBuf::from(&n.file_path), n.duration_sec))
-        .collect();
+        .collect()
+}
+
+fn run_server_intro_pass(ll: &EpisodeLinkedList) -> IntroDetectionPass {
+    let ep_specs = episode_detection_inputs(ll);
     let (detected, method, needs_visual) = detect_show_intros_server(&ep_specs, true);
     IntroDetectionPass {
         detected,
@@ -510,6 +518,7 @@ pub(super) async fn handle_detect_intros(
             return Err(NotflixError::NotFound("Show not found".to_string()));
         };
         let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
+        let valid_ids: HashSet<&str> = ll.iter().map(|n| n.id.as_str()).collect();
 
         let pass = match map.get("fingerprints") {
             None | Some(Value::Null) => run_server_intro_pass(&ll),
@@ -519,7 +528,6 @@ pub(super) async fn handle_detect_intros(
                         "fingerprints must be a list".to_string(),
                     ));
                 };
-                let valid_ids: HashSet<&str> = ll.iter().map(|n| n.id.as_str()).collect();
                 let parsed_fps = parse_client_fingerprints(raw_fps, &valid_ids);
                 let detected = find_shared_intros_default(&parsed_fps);
                 let mark_scanned = map
@@ -535,10 +543,39 @@ pub(super) async fn handle_detect_intros(
             }
         };
 
+        let outros = match map.get("tail_fingerprints") {
+            None | Some(Value::Null) => {
+                let ep_inputs = episode_detection_inputs(&ll);
+                detect_show_outros_server(&ep_inputs, true)
+            }
+            Some(raw_tails_val) => {
+                let Some(raw_tails) = raw_tails_val.as_array() else {
+                    return Err(NotflixError::BadRequest(
+                        "tail_fingerprints must be a list".to_string(),
+                    ));
+                };
+                let parsed_tails = parse_client_fingerprints(raw_tails, &valid_ids);
+                if parsed_tails.len() >= 2 {
+                    find_shared_outros(&parsed_tails)
+                } else {
+                    let ep_inputs = episode_detection_inputs(&ll);
+                    detect_show_outros_server(&ep_inputs, true)
+                }
+            }
+        };
+
         let detected_count = pass.detected.len();
-        let (updated_show, updated_ll) = store
+        let (mut updated_show, mut updated_ll) = store
             .save_show_intros(&show_id, &pass.detected, !force, pass.mark_scanned)?
             .ok_or_else(|| NotflixError::NotFound("Show not found".to_string()))?;
+
+        let outro_count = outros.len();
+        if !outros.is_empty() {
+            if let Some((show_after, ll_after)) = store.save_show_outros(&show_id, &outros, true)? {
+                updated_show = show_after;
+                updated_ll = ll_after;
+            }
+        }
 
         Ok(json_no_store(
             StatusCode::OK,
@@ -546,10 +583,81 @@ pub(super) async fn handle_detect_intros(
                 "show": updated_show,
                 "linked_list": updated_ll.to_json(),
                 "detected_count": detected_count,
+                "outro_detected_count": outro_count,
                 "method": pass.method,
                 "needs_client_visual_scan": pass.needs_visual,
             }),
         ))
     })
     .await?
+}
+
+// ---------------------------------------------------------------------------
+// Show Poster & Watch History Export/Import Endpoints
+// ---------------------------------------------------------------------------
+
+pub(super) async fn handle_show_poster(
+    State(state): State<AppState>,
+    AxumPath(show_id): AxumPath<String>,
+) -> Result<Response> {
+    let store = state.store.clone();
+    let (bytes, mime) = run_blocking(move || {
+        let Some((show, _)) = store.get_show(&show_id)? else {
+            return Err(NotflixError::NotFound("Show not found".to_string()));
+        };
+        let Some(poster_path) = find_show_poster(Path::new(&show.folder_path)) else {
+            return Err(NotflixError::NotFound("Poster not found".to_string()));
+        };
+        let data = std::fs::read(&poster_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                NotflixError::NotFound("Poster not found".to_string())
+            } else {
+                NotflixError::Io(e)
+            }
+        })?;
+        let mime = guess_image_mime(&poster_path);
+        Ok((data, mime))
+    })
+    .await??;
+
+    let mut resp = (StatusCode::OK, bytes).into_response();
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=3600"),
+    );
+    Ok(resp)
+}
+
+pub(super) async fn handle_export_library(State(state): State<AppState>) -> Result<Response> {
+    let store = state.store.clone();
+    let export = run_blocking(move || store.export_watch_history()).await??;
+    let payload = serde_json::to_value(export)
+        .map_err(|e| NotflixError::Internal(format!("Failed to serialize export: {e}")))?;
+    let mut resp = json_no_store(StatusCode::OK, payload);
+    resp.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"notflix-watch-history.json\""),
+    );
+    Ok(resp)
+}
+
+pub(super) async fn handle_import_library(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response> {
+    if body.len() > MAX_JSON_BODY_BYTES {
+        return Err(NotflixError::BadRequest(
+            "Invalid JSON body: Request body too large".to_string(),
+        ));
+    }
+    let export: WatchHistoryExport = serde_json::from_slice(&body)
+        .map_err(|e| NotflixError::BadRequest(format!("Invalid watch history export JSON: {e}")))?;
+    let store = state.store.clone();
+    let summary = run_blocking(move || store.import_watch_history(&export)).await??;
+    Ok(json_no_store(
+        StatusCode::OK,
+        json!({ "ok": true, "summary": summary }),
+    ))
 }

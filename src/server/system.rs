@@ -9,9 +9,10 @@ use serde_json::{json, Map, Value};
 use crate::error::Result;
 use crate::media::detect_ffmpeg;
 use crate::updater::{
-    apply_update, check_for_updates, get_local_repo_info, UpdateResult, DEFAULT_FETCH_TIMEOUT_SEC,
+    apply_update_with_fallback, check_for_updates_with_fallback, get_update_mode_info,
+    UpdateResult, DEFAULT_FETCH_TIMEOUT_SEC,
 };
-use crate::VERSION;
+use crate::{BUILD_SHA, VERSION};
 
 use super::{json_no_store, parse_json_object, run_blocking, AppState};
 
@@ -36,8 +37,9 @@ fn cache_and_respond(state: &AppState, res: UpdateResult) -> Response {
 
 pub(super) async fn handle_health(State(state): State<AppState>) -> Response {
     let repo_dir = state.current_repo_dir();
+    let allow_fallback = state.allow_release_fallback();
     let (commit, ffmpeg_available) = run_blocking(move || {
-        let info = get_local_repo_info(Some(&repo_dir));
+        let info = get_update_mode_info(&repo_dir, allow_fallback);
         (info.local_short_sha, detect_ffmpeg())
     })
     .await
@@ -48,6 +50,7 @@ pub(super) async fn handle_health(State(state): State<AppState>) -> Response {
         json!({
             "status": "ok",
             "version": VERSION,
+            "build_sha": BUILD_SHA,
             "commit": commit,
             "ffmpeg_available": ffmpeg_available,
         }),
@@ -56,19 +59,20 @@ pub(super) async fn handle_health(State(state): State<AppState>) -> Response {
 
 pub(super) async fn handle_update_status(State(state): State<AppState>) -> Response {
     let cached = state.last_update_result.lock().ok().and_then(|g| g.clone());
-    let res = match cached {
-        Some(r) => r,
+    let payload = match cached {
+        Some(r) => serde_json::to_value(r).unwrap_or_default(),
         None => {
             let repo_dir = state.current_repo_dir();
-            run_blocking(move || get_local_repo_info(Some(&repo_dir)))
-                .await
-                .unwrap_or_else(|_| get_local_repo_info(None))
+            let allow_fallback = state.allow_release_fallback();
+            run_blocking(move || {
+                serde_json::to_value(get_update_mode_info(&repo_dir, allow_fallback))
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default()
         }
     };
-    json_no_store(
-        StatusCode::OK,
-        serde_json::to_value(res).unwrap_or_default(),
-    )
+    json_no_store(StatusCode::OK, payload)
 }
 
 pub(super) async fn handle_update_check(
@@ -79,7 +83,11 @@ pub(super) async fn handle_update_check(
     let timeout_sec = extract_timeout(&map);
     let _guard = state.update_lock.lock().await;
     let repo_dir = state.current_repo_dir();
-    let res = run_blocking(move || check_for_updates(Some(&repo_dir), timeout_sec)).await?;
+    let allow_fallback = state.allow_release_fallback();
+    let res = run_blocking(move || {
+        check_for_updates_with_fallback(&repo_dir, allow_fallback, timeout_sec)
+    })
+    .await?;
     Ok(cache_and_respond(&state, res))
 }
 
@@ -91,8 +99,11 @@ pub(super) async fn handle_update_apply(
     let timeout_sec = extract_timeout(&map);
     let _guard = state.update_lock.lock().await;
     let repo_dir = state.current_repo_dir();
+    let allow_fallback = state.allow_release_fallback();
     let db_path = state.store.db_path().to_path_buf();
-    let res =
-        run_blocking(move || apply_update(Some(&repo_dir), Some(&db_path), timeout_sec)).await?;
+    let res = run_blocking(move || {
+        apply_update_with_fallback(&repo_dir, allow_fallback, Some(&db_path), timeout_sec)
+    })
+    .await?;
     Ok(cache_and_respond(&state, res))
 }

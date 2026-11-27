@@ -8,9 +8,10 @@ use axum::http::{header, StatusCode};
 use http_body_util::BodyExt;
 use notflix::chapters as chapters_mod;
 use notflix::intro_detector::{
-    self as detector_mod, build_fingerprint, detect_intro_from_chapters, detect_show_intros_server,
+    self as detector_mod, build_fingerprint, detect_intro_from_chapters,
+    detect_outro_from_chapters, detect_show_intros_server, detect_show_outros_server,
     extract_audio_fingerprint_from_pcm, extract_mkv_chapters, extract_mp4_chapters,
-    find_shared_intros_default, ChapterMarker,
+    find_shared_intros_default, find_shared_outros, is_outro_chapter_title, ChapterMarker,
 };
 use notflix::media::{guess_video_mime, parse_range_header, stream_video_file};
 
@@ -788,4 +789,189 @@ fn opening_fanfare_and_audio_theme_never_bridge_cold_open() {
             span.end_sec
         );
     }
+}
+
+#[test]
+fn outro_chapter_title_matching_accepts_credits_and_rejects_intros() {
+    for title in [
+        "Credits",
+        "End Credits",
+        "Closing Credits",
+        "Ending",
+        "Ending Theme",
+        "Outro",
+        "ED",
+        "ED1",
+        "ED2",
+        "ED 2",
+        "Closing",
+        "Closing Theme",
+        "End Theme",
+        "End Titles",
+        "Next Time",
+        "Next Episode",
+        "Preview",
+        "Epilogue",
+        "Chapter 6: End Credits",
+    ] {
+        assert!(
+            is_outro_chapter_title(title),
+            "expected outro match for {title:?}"
+        );
+        assert!(
+            chapters_mod::is_outro_chapter_title(title),
+            "expected direct chapters match for {title:?}"
+        );
+    }
+
+    for title in [
+        "",
+        "   ",
+        "Opening",
+        "Opening Credits",
+        "Intro",
+        "Intro Credits",
+        "Cold Open",
+        "Act I",
+        "Chapter 1",
+        "Edited Scene",
+        "Redemption",
+        "The Wedding",
+    ] {
+        assert!(
+            !is_outro_chapter_title(title),
+            "expected non-outro for {title:?}"
+        );
+    }
+}
+
+#[test]
+fn detect_outro_from_chapters_rejects_early_and_accepts_final_credits() {
+    let duration = 1200.0;
+
+    // Early chapter titled "Credits" (at 5% of duration) must be rejected
+    let early_only = vec![
+        ChapterMarker {
+            start_sec: 60.0,
+            end_sec: Some(120.0),
+            title: "Credits".to_string(),
+        },
+        ChapterMarker {
+            start_sec: 120.0,
+            end_sec: Some(duration),
+            title: "Main Episode".to_string(),
+        },
+    ];
+    assert!(detect_outro_from_chapters(&early_only, duration).is_none());
+
+    // Final-35% "End Credits" (and later "Preview") picks earliest valid outro chapter
+    let with_credits = vec![
+        ChapterMarker {
+            start_sec: 0.0,
+            end_sec: Some(90.0),
+            title: "Opening Credits".to_string(),
+        },
+        ChapterMarker {
+            start_sec: 90.0,
+            end_sec: Some(1110.0),
+            title: "Main Episode".to_string(),
+        },
+        ChapterMarker {
+            start_sec: 1110.0,
+            end_sec: Some(1175.0),
+            title: "End Credits".to_string(),
+        },
+        ChapterMarker {
+            start_sec: 1175.0,
+            end_sec: Some(1200.0),
+            title: "Preview".to_string(),
+        },
+    ];
+    let span = detect_outro_from_chapters(&with_credits, duration).expect("outro span");
+    assert!((span.start_sec - 1110.0).abs() < 1e-6);
+    assert!((span.end_sec - 1200.0).abs() < 1e-6);
+    assert!((span.confidence - 0.96).abs() < 1e-6);
+    assert_eq!(span.source, "chapter");
+
+    // Works when duration_sec == 0.0 by deriving effective duration from chapter end_sec
+    let derived = detect_outro_from_chapters(&with_credits, 0.0).expect("derived outro span");
+    assert!((derived.start_sec - 1110.0).abs() < 1e-6);
+    assert!((derived.end_sec - 1200.0).abs() < 1e-6);
+
+    // Server-side chapter outro detection picks up MKV files without ffmpeg
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ep1_mkv = tmp.path().join("S01E01.mkv");
+    fs::write(
+        &ep1_mkv,
+        build_minimal_mkv_with_chapters(&[
+            (0.0, 60.0, "Opening Credits"),
+            (60.0, 1115.0, "Episode"),
+            (1115.0, 1200.0, "End Credits"),
+        ]),
+    )
+    .expect("write mkv");
+    let server_outros = detect_show_outros_server(&[("ep1".to_string(), ep1_mkv, 1200.0)], false);
+    let ep1_outro = server_outros.get("ep1").expect("server chapter outro");
+    assert!((ep1_outro.start_sec - 1115.0).abs() < 1e-6);
+    assert_eq!(ep1_outro.source, "chapter");
+}
+
+#[test]
+fn find_shared_outros_converts_tail_offsets_and_guards_first_half() {
+    let mut rng = Rng::new(8888);
+    let step = 1.0;
+    // 40s shared ending theme placed inside a 180s tail window
+    let outro_template: Vec<Vec<f64>> = (0..40).map(|_| rand_vec(&mut rng, 48)).collect();
+
+    // Ep1: duration 1300s, tail window covers [1120..1300], outro at tail offset 100..140 -> abs 1220..1260
+    // Ep2: duration 1400s, tail window covers [1220..1400], outro at tail offset 120..160 -> abs 1340..1380
+    // Ep3: duration 1250s, tail window covers [1070..1250], outro at tail offset 90..130  -> abs 1160..1200
+    let cases = [
+        ("ep1", 1300.0_f64, 100usize),
+        ("ep2", 1400.0_f64, 120usize),
+        ("ep3", 1250.0_f64, 90usize),
+    ];
+    let fps: Vec<_> = cases
+        .iter()
+        .map(|&(id, dur, tail_off)| {
+            let raw = make_episode_vectors(&mut rng, 180, Some(&outro_template), tail_off, 6.0);
+            build_fingerprint(id, step, &raw, None, dur, "audio", 8.0)
+        })
+        .collect();
+
+    let detected = find_shared_outros(&fps);
+    assert_eq!(detected.len(), 3);
+    for &(id, dur, tail_off) in &cases {
+        let span = &detected[id];
+        let window_start = dur - 180.0;
+        let expected_start = window_start + (tail_off as f64) * step;
+        let expected_end = expected_start + 40.0 * step;
+        assert!(
+            (span.start_sec - expected_start).abs() <= 2.0,
+            "{id}: expected outro start ~{expected_start}, got {}",
+            span.start_sec
+        );
+        assert!(
+            (span.end_sec - expected_end).abs() <= 2.0,
+            "{id}: expected outro end ~{expected_end}, got {}",
+            span.end_sec
+        );
+        assert_eq!(span.source, "audio");
+    }
+
+    // Safety guard: if a shared sequence falls in the first 55% of a short episode
+    // (duration 200s, tail window 180s -> window_start 20s, match at tail offset 10s -> abs 30s < 110s),
+    // find_shared_outros must reject it.
+    let short_fps: Vec<_> = ["short1", "short2"]
+        .iter()
+        .map(|&id| {
+            let raw = make_episode_vectors(&mut rng, 180, Some(&outro_template), 10, 5.0);
+            build_fingerprint(id, step, &raw, None, 200.0, "audio", 8.0)
+        })
+        .collect();
+    let short_detected = find_shared_outros(&short_fps);
+    assert!(
+        short_detected.is_empty(),
+        "expected first-half match to be rejected, got {short_detected:?}"
+    );
 }

@@ -782,3 +782,64 @@ pub fn find_shared_intros_default(
 ) -> HashMap<String, IntroSpan> {
     find_shared_intros(fingerprints, MIN_INTRO_SEC, MAX_INTRO_SEC, 0.70, 6)
 }
+
+#[inline]
+fn round2(value: f64) -> f64 {
+    let rounded = (value * 100.0).round() / 100.0;
+    if rounded == 0.0 {
+        0.0
+    } else {
+        rounded
+    }
+}
+
+/// Find the repeating outro/credits sequence across episodes from tail fingerprints.
+///
+/// Each fingerprint in `tail_fingerprints` must store the full episode duration in
+/// `duration_sec` and tail feature vectors covering the final
+/// `vectors.len() as f64 * step_sec` seconds of the episode. Matched tail offsets are
+/// converted back into absolute episode timestamps, rejecting any match starting in the
+/// first 55% of the episode.
+pub fn find_shared_outros(tail_fingerprints: &[EpisodeFingerprint]) -> HashMap<String, IntroSpan> {
+    let raw_matches = find_shared_intros(tail_fingerprints, 15.0, 140.0, 0.70, 6);
+    if raw_matches.is_empty() {
+        return HashMap::new();
+    }
+
+    let fp_by_id: HashMap<&str, &EpisodeFingerprint> = tail_fingerprints
+        .iter()
+        .map(|fp| (fp.episode_id.as_str(), fp))
+        .collect();
+
+    let mut results = HashMap::with_capacity(raw_matches.len());
+    for (ep_id, span) in raw_matches {
+        let Some(&fp) = fp_by_id.get(ep_id.as_str()) else {
+            continue;
+        };
+        let window_len = (fp.vectors.len() as f64) * fp.step_sec;
+        let window_start = (fp.duration_sec - window_len).max(0.0);
+        let abs_start = window_start + span.start_sec;
+        let raw_end = window_start + span.end_sec;
+        let abs_end = if fp.duration_sec > 0.0 {
+            raw_end.min(fp.duration_sec).max(abs_start)
+        } else {
+            raw_end
+        };
+
+        if fp.duration_sec > 0.0 && abs_start < fp.duration_sec * 0.55 {
+            continue;
+        }
+
+        results.insert(
+            ep_id,
+            IntroSpan {
+                start_sec: round2(abs_start),
+                end_sec: round2(abs_end),
+                confidence: span.confidence,
+                source: span.source,
+            },
+        );
+    }
+
+    results
+}

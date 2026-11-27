@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS episodes (
     intro_end_sec REAL,
     intro_confidence REAL NOT NULL DEFAULT 0.0,
     intro_source TEXT NOT NULL DEFAULT '',
+    outro_start_sec REAL,
+    outro_source TEXT NOT NULL DEFAULT '',
     UNIQUE(show_id, relative_path)
 );
 
@@ -68,6 +70,8 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("episodes", "intro_end_sec", "REAL"),
     ("episodes", "intro_confidence", "REAL NOT NULL DEFAULT 0.0"),
     ("episodes", "intro_source", "TEXT NOT NULL DEFAULT ''"),
+    ("episodes", "outro_start_sec", "REAL"),
+    ("episodes", "outro_source", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 const EPISODE_INSERT_SQL: &str = "\
@@ -76,13 +80,13 @@ INSERT INTO episodes (
     season, episode_number, disc, is_extra, confidence, sort_reason,
     prev_episode_id, next_episode_id, position_sec, duration_sec,
     watched, file_size, intro_start_sec, intro_end_sec,
-    intro_confidence, intro_source
+    intro_confidence, intro_source, outro_start_sec, outro_source
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6,
     ?7, ?8, ?9, ?10, ?11, ?12,
     ?13, ?14, ?15, ?16,
     ?17, ?18, ?19, ?20,
-    ?21, ?22
+    ?21, ?22, ?23, ?24
 )";
 
 /// Persisted TV show metadata record.
@@ -115,6 +119,7 @@ pub struct ShowSummary {
     pub disc_count: usize,
     pub extra_count: usize,
     pub intros_detected_count: usize,
+    pub has_poster: bool,
     pub current_episode: Option<EpisodeJson>,
     pub next_episode: Option<EpisodeJson>,
 }
@@ -126,6 +131,64 @@ pub struct RescanDiff {
     pub removed: usize,
     pub unchanged: usize,
     pub total: usize,
+}
+
+/// Portable watch-history snapshot for a single episode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportEpisode {
+    pub relative_path: String,
+    pub filename: String,
+    pub position_sec: f64,
+    pub duration_sec: f64,
+    pub watched: bool,
+    pub intro_start_sec: Option<f64>,
+    pub intro_end_sec: Option<f64>,
+    pub intro_source: String,
+    pub outro_start_sec: Option<f64>,
+    pub outro_source: String,
+}
+
+/// Portable watch-history snapshot for a single TV show.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportShow {
+    pub name: String,
+    pub folder_path: String,
+    pub current_episode_relative_path: Option<String>,
+    pub last_watched_at: Option<String>,
+    pub episodes: Vec<ExportEpisode>,
+}
+
+/// Top-level portable watch-history JSON backup format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchHistoryExport {
+    pub version: u32,
+    pub exported_at: String,
+    pub shows: Vec<ExportShow>,
+}
+
+/// Result counts returned after importing a [`WatchHistoryExport`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportSummary {
+    pub matched_shows: usize,
+    pub unmatched_shows: usize,
+    pub updated_episodes: usize,
+    pub skipped_episodes: usize,
+}
+
+fn normalize_path_key(raw: &str) -> String {
+    let replaced = raw.trim().replace('\\', "/");
+    let trimmed = replaced.trim_end_matches('/');
+    if trimmed.is_empty() && !replaced.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_ascii_lowercase()
+    }
+}
+
+fn normalize_rel_path(raw: &str) -> String {
+    let replaced = raw.trim().replace('\\', "/");
+    let stripped = replaced.trim_start_matches("./").trim_start_matches('/');
+    stripped.to_ascii_lowercase()
 }
 
 /// Determine the default SQLite database path.
@@ -199,6 +262,14 @@ impl NotflixStore {
     /// Return the resolved filesystem path of the SQLite database.
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    /// Return the parent directory containing the SQLite database file.
+    pub fn db_dir(&self) -> PathBuf {
+        self.db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>> {
@@ -283,6 +354,10 @@ impl NotflixStore {
             intro_source: row
                 .get::<_, Option<String>>("intro_source")?
                 .unwrap_or_default(),
+            outro_start_sec: row.get("outro_start_sec")?,
+            outro_source: row
+                .get::<_, Option<String>>("outro_source")?
+                .unwrap_or_default(),
         })
     }
 
@@ -363,6 +438,8 @@ impl NotflixStore {
                     node.intro_end_sec,
                     node.intro_confidence,
                     &node.intro_source,
+                    node.outro_start_sec,
+                    &node.outro_source,
                 ])?;
             }
         }
@@ -421,6 +498,8 @@ impl NotflixStore {
             intro_end_sec: existing.and_then(|e| e.intro_end_sec),
             intro_confidence: existing.map_or(0.0, |e| e.intro_confidence),
             intro_source: existing.map(|e| e.intro_source.clone()).unwrap_or_default(),
+            outro_start_sec: existing.and_then(|e| e.outro_start_sec),
+            outro_source: existing.map(|e| e.outro_source.clone()).unwrap_or_default(),
         }
     }
 
@@ -573,6 +652,7 @@ impl NotflixStore {
             let next_episode = ll
                 .peek_next()
                 .and_then(|n| ll.node_to_json(&n.id, current_idx.map(|i| i + 1)));
+            let has_poster = crate::media::find_show_poster(Path::new(&show.folder_path)).is_some();
 
             results.push(ShowSummary {
                 show,
@@ -583,6 +663,7 @@ impl NotflixStore {
                 disc_count: discs.len(),
                 extra_count: episode_count.saturating_sub(main_episode_count),
                 intros_detected_count,
+                has_poster,
                 current_episode,
                 next_episode,
             });
@@ -1056,5 +1137,292 @@ impl NotflixStore {
         let ll = Self::load_linked_list(&tx, &updated_show)?;
         tx.commit()?;
         Ok(Some((updated_show, ll)))
+    }
+
+    /// Persist detected outro/credits timestamps for episodes in a show.
+    pub fn save_show_outros(
+        &self,
+        show_id: &str,
+        outros: &HashMap<String, IntroSpan>,
+        preserve_manual: bool,
+    ) -> Result<Option<(ShowRecord, EpisodeLinkedList)>> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+
+        if Self::fetch_show(&tx, show_id, false)?.is_none() {
+            return Ok(None);
+        }
+
+        if !outros.is_empty() {
+            let mut src_stmt =
+                tx.prepare_cached("SELECT id, outro_source FROM episodes WHERE show_id = ?1")?;
+            let existing_sources: HashMap<String, String> = src_stmt
+                .query_map(params![show_id], |row| {
+                    let id: String = row.get(0)?;
+                    let src: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+                    Ok((id, src))
+                })?
+                .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+
+            let mut update_stmt = tx.prepare_cached(
+                "UPDATE episodes
+                 SET outro_start_sec = ?1, outro_source = ?2
+                 WHERE id = ?3 AND show_id = ?4",
+            )?;
+
+            for (ep_id, span) in outros {
+                let Some(existing_source) = existing_sources.get(ep_id) else {
+                    continue;
+                };
+                if preserve_manual && existing_source == "manual" {
+                    continue;
+                }
+                let start = finite_non_negative(span.start_sec);
+                update_stmt.execute(params![start, &span.source, ep_id, show_id])?;
+            }
+        }
+
+        let updated_show = Self::fetch_show(&tx, show_id, true)?.ok_or_else(|| {
+            NotflixError::Internal("Updated show could not be loaded".to_string())
+        })?;
+        let ll = Self::load_linked_list(&tx, &updated_show)?;
+        tx.commit()?;
+        Ok(Some((updated_show, ll)))
+    }
+
+    /// Export all shows' watch progress, active episode pointers, and intro/outro markers
+    /// as a portable JSON-serializable snapshot.
+    pub fn export_watch_history(&self) -> Result<WatchHistoryExport> {
+        let conn = self.lock_conn()?;
+        let mut show_stmt = conn.prepare_cached(
+            "SELECT * FROM shows
+             ORDER BY
+                 CASE WHEN last_watched_at IS NULL THEN 1 ELSE 0 END,
+                 last_watched_at DESC,
+                 created_at DESC",
+        )?;
+        let shows: Vec<ShowRecord> = show_stmt
+            .query_map([], |row| Self::row_to_show(row, false))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut exported_shows = Vec::with_capacity(shows.len());
+        for show in shows {
+            let ll = Self::load_linked_list(&conn, &show)?;
+            let current_episode_relative_path = ll.current().map(|n| n.relative_path.clone());
+            let episodes: Vec<ExportEpisode> = ll
+                .iter()
+                .map(|ep| ExportEpisode {
+                    relative_path: ep.relative_path.clone(),
+                    filename: ep.filename.clone(),
+                    position_sec: ep.position_sec,
+                    duration_sec: ep.duration_sec,
+                    watched: ep.watched,
+                    intro_start_sec: ep.intro_start_sec,
+                    intro_end_sec: ep.intro_end_sec,
+                    intro_source: ep.intro_source.clone(),
+                    outro_start_sec: ep.outro_start_sec,
+                    outro_source: ep.outro_source.clone(),
+                })
+                .collect();
+
+            exported_shows.push(ExportShow {
+                name: show.name,
+                folder_path: show.folder_path,
+                current_episode_relative_path,
+                last_watched_at: show.last_watched_at,
+                episodes,
+            });
+        }
+
+        Ok(WatchHistoryExport {
+            version: 1,
+            exported_at: utc_now(),
+            shows: exported_shows,
+        })
+    }
+
+    /// Import a portable [`WatchHistoryExport`] into matching shows and episodes in this database.
+    ///
+    /// Matches shows by normalized `folder_path` first, falling back to case-insensitive `name`
+    /// so backups transfer cleanly across operating systems and drive layouts.
+    pub fn import_watch_history(&self, export: &WatchHistoryExport) -> Result<ImportSummary> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+
+        let local_shows: Vec<ShowRecord> = tx
+            .prepare_cached("SELECT * FROM shows")?
+            .query_map([], |row| Self::row_to_show(row, false))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut shows_by_path: HashMap<String, usize> = HashMap::with_capacity(local_shows.len());
+        let mut shows_by_name: HashMap<String, usize> = HashMap::with_capacity(local_shows.len());
+        for (idx, show) in local_shows.iter().enumerate() {
+            shows_by_path
+                .entry(normalize_path_key(&show.folder_path))
+                .or_insert(idx);
+            shows_by_name
+                .entry(show.name.trim().to_ascii_lowercase())
+                .or_insert(idx);
+        }
+
+        let mut matched_shows = 0usize;
+        let mut unmatched_shows = 0usize;
+        let mut updated_episodes = 0usize;
+        let mut skipped_episodes = 0usize;
+
+        for exp_show in &export.shows {
+            let local_idx = shows_by_path
+                .get(&normalize_path_key(&exp_show.folder_path))
+                .copied()
+                .or_else(|| {
+                    shows_by_name
+                        .get(&exp_show.name.trim().to_ascii_lowercase())
+                        .copied()
+                });
+
+            let Some(idx) = local_idx else {
+                unmatched_shows += 1;
+                skipped_episodes += exp_show.episodes.len();
+                continue;
+            };
+
+            matched_shows += 1;
+            let local_show = &local_shows[idx];
+            let local_ll = Self::load_linked_list(&tx, local_show)?;
+
+            let mut ep_id_by_rel: HashMap<String, String> = HashMap::with_capacity(local_ll.len());
+            let mut ep_id_by_filename: HashMap<String, String> =
+                HashMap::with_capacity(local_ll.len());
+            let mut filename_counts: HashMap<String, usize> =
+                HashMap::with_capacity(local_ll.len());
+            let mut ep_by_id: HashMap<String, EpisodeNode> = HashMap::with_capacity(local_ll.len());
+
+            for ep in local_ll.iter() {
+                ep_id_by_rel.insert(normalize_rel_path(&ep.relative_path), ep.id.clone());
+                let fn_key = ep.filename.trim().to_ascii_lowercase();
+                *filename_counts.entry(fn_key.clone()).or_insert(0) += 1;
+                ep_id_by_filename.insert(fn_key, ep.id.clone());
+                ep_by_id.insert(ep.id.clone(), ep.clone());
+            }
+
+            {
+                let mut update_ep_stmt = tx.prepare_cached(
+                    "UPDATE episodes
+                     SET position_sec = ?1,
+                         duration_sec = ?2,
+                         watched = ?3,
+                         intro_start_sec = ?4,
+                         intro_end_sec = ?5,
+                         intro_source = ?6,
+                         outro_start_sec = ?7,
+                         outro_source = ?8
+                     WHERE id = ?9 AND show_id = ?10",
+                )?;
+
+                for exp_ep in &exp_show.episodes {
+                    let matched_ep_id = ep_id_by_rel
+                        .get(&normalize_rel_path(&exp_ep.relative_path))
+                        .cloned()
+                        .or_else(|| {
+                            let fn_key = exp_ep.filename.trim().to_ascii_lowercase();
+                            if filename_counts.get(&fn_key).copied() == Some(1) {
+                                ep_id_by_filename.get(&fn_key).cloned()
+                            } else {
+                                None
+                            }
+                        });
+
+                    let Some(ep_id) = matched_ep_id else {
+                        skipped_episodes += 1;
+                        continue;
+                    };
+                    let Some(local_ep) = ep_by_id.get(&ep_id) else {
+                        skipped_episodes += 1;
+                        continue;
+                    };
+
+                    let mut pos = finite_non_negative(exp_ep.position_sec);
+                    let dur = if exp_ep.duration_sec.is_finite() && exp_ep.duration_sec > 0.0 {
+                        exp_ep.duration_sec
+                    } else {
+                        local_ep.duration_sec
+                    };
+                    if dur > 0.0 && pos > dur {
+                        pos = dur;
+                    }
+
+                    let (intro_start, intro_end, intro_source) =
+                        if let Some(start) = exp_ep.intro_start_sec {
+                            (
+                                Some(finite_non_negative(start)),
+                                exp_ep.intro_end_sec.map(finite_non_negative),
+                                exp_ep.intro_source.clone(),
+                            )
+                        } else {
+                            (
+                                local_ep.intro_start_sec,
+                                local_ep.intro_end_sec,
+                                local_ep.intro_source.clone(),
+                            )
+                        };
+
+                    let (outro_start, outro_source) = if let Some(start) = exp_ep.outro_start_sec {
+                        (
+                            Some(finite_non_negative(start)),
+                            exp_ep.outro_source.clone(),
+                        )
+                    } else {
+                        (local_ep.outro_start_sec, local_ep.outro_source.clone())
+                    };
+
+                    update_ep_stmt.execute(params![
+                        pos,
+                        dur,
+                        i64::from(exp_ep.watched),
+                        intro_start,
+                        intro_end,
+                        &intro_source,
+                        outro_start,
+                        &outro_source,
+                        &ep_id,
+                        &local_show.id,
+                    ])?;
+                    updated_episodes += 1;
+                }
+            }
+
+            if let Some(ref cur_rel) = exp_show.current_episode_relative_path {
+                let norm_cur = normalize_rel_path(cur_rel);
+                let matched_cur_id = ep_id_by_rel.get(&norm_cur).cloned().or_else(|| {
+                    let fname = norm_cur.rsplit('/').next().unwrap_or("");
+                    if !fname.is_empty() && filename_counts.get(fname).copied() == Some(1) {
+                        ep_id_by_filename.get(fname).cloned()
+                    } else {
+                        None
+                    }
+                });
+                if let Some(cur_id) = matched_cur_id {
+                    tx.prepare_cached("UPDATE shows SET current_episode_id = ?1 WHERE id = ?2")?
+                        .execute(params![cur_id, &local_show.id])?;
+                }
+            }
+
+            if let Some(last_watched) = exp_show
+                .last_watched_at
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+            {
+                tx.prepare_cached("UPDATE shows SET last_watched_at = ?1 WHERE id = ?2")?
+                    .execute(params![last_watched, &local_show.id])?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(ImportSummary {
+            matched_shows,
+            unmatched_shows,
+            updated_episodes,
+            skipped_episodes,
+        })
     }
 }

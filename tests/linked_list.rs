@@ -27,6 +27,8 @@ fn make_node(ep_id: &str, ep_num: i64) -> EpisodeNode {
         intro_end_sec: None,
         intro_confidence: 0.0,
         intro_source: String::new(),
+        outro_start_sec: None,
+        outro_source: String::new(),
     }
 }
 
@@ -233,6 +235,8 @@ fn test_progress_percent_and_json_serialization() {
     node.intro_start_sec = Some(12.346);
     node.intro_end_sec = Some(85.678);
     node.intro_confidence = 0.912;
+    node.outro_start_sec = Some(91.236);
+    node.outro_source = "chapter".to_string();
 
     assert_eq!(node.progress_percent(), 33.3);
 
@@ -255,6 +259,8 @@ fn test_progress_percent_and_json_serialization() {
     assert_eq!(ep.intro_start_sec, Some(12.35));
     assert_eq!(ep.intro_end_sec, Some(85.68));
     assert_eq!(ep.intro_confidence, 0.91);
+    assert_eq!(ep.outro_start_sec, Some(91.24));
+    assert_eq!(ep.outro_source, "chapter");
     assert_eq!(ep.display_code, "S01E01");
 
     // Verify `index` is omitted when None

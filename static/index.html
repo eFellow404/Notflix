@@ -17,7 +17,7 @@
     </div>
     <div class="topbar-right">
       <button id="navLibraryBtn" class="btn btn-ghost hidden" type="button">← Library</button>
-      <button id="updateBtn" class="btn btn-ghost btn-sm" type="button" title="Check remote Git repository for updates">↻ Updates</button>
+      <button id="updateBtn" class="btn btn-ghost btn-sm" type="button" title="Check for updates">↻ Updates</button>
       <button id="openAddModalBtn" class="btn btn-primary" type="button">+ Add TV Folder</button>
     </div>
   </header>
@@ -27,20 +27,34 @@
     <section id="libraryView" class="view">
       <div id="continueHero" class="hero hidden"></div>
 
+      <section id="continueSection" class="continue-section hidden" aria-label="Continue Watching">
+        <div class="continue-section-header">
+          <h2>Continue Watching</h2>
+        </div>
+        <div id="continueStrip" class="continue-strip"></div>
+      </section>
+
       <div id="libraryHeader" class="section-header hidden">
         <div>
           <h1>Your TV Shows</h1>
           <p class="muted">Automatically organized by season &amp; episode with resume playback.</p>
         </div>
-        <div id="libraryToolbar" class="library-toolbar hidden">
-          <div class="search-input-wrap">
-            <input id="librarySearchInput" type="search" placeholder="Filter shows…" aria-label="Filter shows" />
+        <div class="library-header-right">
+          <div id="libraryToolbar" class="library-toolbar hidden">
+            <div class="search-input-wrap">
+              <input id="librarySearchInput" type="search" placeholder="Filter shows…" aria-label="Filter shows" />
+            </div>
+            <select id="librarySortSelect" class="select-control" aria-label="Sort shows">
+              <option value="recent">Recently Watched</option>
+              <option value="alpha">Title (A–Z)</option>
+              <option value="progress">Most Watched</option>
+            </select>
           </div>
-          <select id="librarySortSelect" class="select-control" aria-label="Sort shows">
-            <option value="recent">Recently Watched</option>
-            <option value="alpha">Title (A–Z)</option>
-            <option value="progress">Most Watched</option>
-          </select>
+          <div class="library-io-actions">
+            <button id="btnExportLibrary" class="btn btn-ghost btn-sm" type="button" title="Export watch history to JSON">↓ Export</button>
+            <button id="btnImportLibrary" class="btn btn-ghost btn-sm" type="button" title="Import watch history from JSON">↑ Import</button>
+            <input id="importFileInput" type="file" accept=".json" class="hidden" />
+          </div>
         </div>
       </div>
 
@@ -138,6 +152,7 @@
                   <div class="seek-track">
                     <div id="seekBuffered" class="seek-buffered"></div>
                     <div id="seekIntroRange" class="seek-intro-range hidden" title="Detected Intro"></div>
+                    <div id="seekOutroMarker" class="seek-outro-marker hidden" title="Detected Credits / Outro"></div>
                     <div id="seekProgress" class="seek-progress"></div>
                   </div>
                   <div id="seekThumb" class="seek-thumb"></div>
@@ -156,6 +171,8 @@
                   <span id="ctrlTimeDisplay" class="ctrl-time">0:00 / 0:00</span>
                 </div>
                 <div class="controls-right">
+                  <button id="ctrlSubBtn" class="ctrl-btn ctrl-text ctrl-pill-toggle hidden" type="button" title="Subtitles (C)">CC</button>
+                  <button id="ctrlAudioBtn" class="ctrl-btn ctrl-text ctrl-pill-toggle hidden" type="button" title="Audio Track">♪</button>
                   <button id="ctrlSpeedBtn" class="ctrl-btn ctrl-text" type="button" title="Playback speed">1×</button>
                   <button id="ctrlAutoplayBtn" class="ctrl-btn ctrl-text ctrl-pill-toggle" type="button" title="Auto-play next episode when current finishes">Autoplay</button>
                   <button id="ctrlNextEpBtn" class="ctrl-btn ctrl-text hidden" type="button" title="Next Episode (N)">Next Ep →</button>
@@ -169,6 +186,9 @@
               <div class="player-error-title">Unable to play this video format in browser</div>
               <p id="playerErrorMsg"></p>
               <code id="playerErrorPath"></code>
+              <div class="player-error-actions">
+                <button id="btnFixAudioRemux" class="btn btn-primary btn-sm" type="button">Fix Audio (Remux)</button>
+              </div>
             </div>
           </div>
 
@@ -239,6 +259,7 @@
               <span><kbd>←</kbd> / <kbd>→</kbd> Seek ±10s</span>
               <span><kbd>↑</kbd> / <kbd>↓</kbd> Volume</span>
               <span><kbd>M</kbd> Mute / Unmute</span>
+              <span><kbd>C</kbd> Subtitles</span>
               <span><kbd>S</kbd> Skip Intro</span>
               <span><kbd>F</kbd> Fullscreen</span>
               <span><kbd>N</kbd> Next Episode</span>

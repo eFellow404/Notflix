@@ -1,10 +1,20 @@
 //! Build script embedding the short Git commit SHA into the compiled binary.
 
+use std::path::Path;
 use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
     println!("cargo:rerun-if-changed=.git/HEAD");
+
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        if let Some(ref_path) = head.trim().strip_prefix("ref: ") {
+            let full_ref = format!(".git/{}", ref_path.trim());
+            if Path::new(&full_ref).exists() {
+                println!("cargo:rerun-if-changed={full_ref}");
+            }
+        }
+    }
 
     let sha = std::env::var("GITHUB_SHA")
         .ok()

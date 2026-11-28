@@ -1,9 +1,12 @@
 //! Integration tests for the Notflix HTTP server, REST API, static assets, and byte-range streaming.
 
+mod common;
+
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 
+use common::{make_episode_vectors, rand_vec, Rng};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::Request;
@@ -120,25 +123,27 @@ impl TestServer {
         });
         (status, json)
     }
-}
 
-struct SimpleRng(u64);
-
-impl SimpleRng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn next_f64(&mut self) -> f64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
-    }
-
-    fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
-        lo + (hi - lo) * self.next_f64()
+    async fn create_show(&self, name: &str) -> (String, Vec<String>) {
+        let (status, created) = self
+            .req_json(
+                "POST",
+                "/api/shows",
+                Some(json!({
+                    "folder_path": self.show_dir.to_string_lossy(),
+                    "name": name
+                })),
+            )
+            .await;
+        assert_eq!(status, 201);
+        let show_id = created["show"]["id"].as_str().unwrap().to_string();
+        let ep_ids = created["linked_list"]["episodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect();
+        (show_id, ep_ids)
     }
 }
 
@@ -307,20 +312,10 @@ async fn test_full_api_flow_and_range_streaming() {
     assert!(det.get("needs_client_visual_scan").is_some());
 
     // 10. Intro detection with client-supplied visual fingerprints
-    let mut rng = SimpleRng::new(7);
-    let tmpl: Vec<Vec<f64>> = (0..20)
-        .map(|_| (0..36).map(|_| rng.uniform(20.0, 235.0)).collect())
-        .collect();
-    let mut ep1_vecs: Vec<Vec<f64>> = (0..80)
-        .map(|_| (0..36).map(|_| rng.uniform(20.0, 235.0)).collect())
-        .collect();
-    let mut ep2_vecs: Vec<Vec<f64>> = (0..80)
-        .map(|_| (0..36).map(|_| rng.uniform(20.0, 235.0)).collect())
-        .collect();
-    for (idx, vec) in tmpl.iter().enumerate() {
-        ep1_vecs[10 + idx] = vec.clone();
-        ep2_vecs[30 + idx] = vec.clone();
-    }
+    let mut rng = Rng::new(7);
+    let tmpl: Vec<Vec<f64>> = (0..20).map(|_| rand_vec(&mut rng, 36)).collect();
+    let ep1_vecs = make_episode_vectors(&mut rng, 80, 36, Some(&tmpl), 10, 0.0);
+    let ep2_vecs = make_episode_vectors(&mut rng, 80, 36, Some(&tmpl), 30, 0.0);
 
     let (status, vis) = srv
         .req_json(
@@ -495,19 +490,7 @@ async fn test_update_endpoints_never_crash_when_non_repo_or_offline() {
 #[tokio::test]
 async fn test_show_poster_endpoint_and_has_poster_flag() {
     let srv = TestServer::start().await;
-
-    let (status, created) = srv
-        .req_json(
-            "POST",
-            "/api/shows",
-            Some(json!({
-                "folder_path": srv.show_dir.to_string_lossy(),
-                "name": "Poster Show"
-            })),
-        )
-        .await;
-    assert_eq!(status, 201);
-    let show_id = created["show"]["id"].as_str().unwrap().to_string();
+    let (show_id, _) = srv.create_show("Poster Show").await;
 
     // Without a poster file: has_poster is false and /poster returns 404
     let (status, shows_before) = srv.req_json("GET", "/api/shows", None).await;
@@ -555,20 +538,8 @@ async fn test_episode_tracks_subtitles_and_thumbnail_endpoints() {
     let fake_thumb = b"\xff\xd8\xff\xe0\x00\x10JFIF-THUMB-BYTES".to_vec();
     fs::write(srv.show_dir.join("S01E01.jpg"), &fake_thumb).unwrap();
 
-    let (status, created) = srv
-        .req_json(
-            "POST",
-            "/api/shows",
-            Some(json!({
-                "folder_path": srv.show_dir.to_string_lossy(),
-                "name": "Track Show"
-            })),
-        )
-        .await;
-    assert_eq!(status, 201);
-    let eps = created["linked_list"]["episodes"].as_array().unwrap();
-    let ep1_id = eps[0]["id"].as_str().unwrap().to_string();
-    let ep2_id = eps[1]["id"].as_str().unwrap().to_string();
+    let (_, ep_ids) = srv.create_show("Track Show").await;
+    let (ep1_id, ep2_id) = (&ep_ids[0], &ep_ids[1]);
 
     // GET /api/episodes/{id}/tracks
     let (status, tracks) = srv
@@ -637,37 +608,13 @@ async fn test_episode_tracks_subtitles_and_thumbnail_endpoints() {
 #[tokio::test]
 async fn test_detect_intros_with_tail_fingerprints_saves_outro() {
     let srv = TestServer::start().await;
+    let (show_id, ep_ids) = srv.create_show("Outro Show").await;
+    let (ep1_id, ep2_id) = (&ep_ids[0], &ep_ids[1]);
 
-    let (status, created) = srv
-        .req_json(
-            "POST",
-            "/api/shows",
-            Some(json!({
-                "folder_path": srv.show_dir.to_string_lossy(),
-                "name": "Outro Show"
-            })),
-        )
-        .await;
-    assert_eq!(status, 201);
-    let show_id = created["show"]["id"].as_str().unwrap().to_string();
-    let eps = created["linked_list"]["episodes"].as_array().unwrap();
-    let ep1_id = eps[0]["id"].as_str().unwrap().to_string();
-    let ep2_id = eps[1]["id"].as_str().unwrap().to_string();
-
-    let mut rng = SimpleRng::new(42);
-    let shared_outro: Vec<Vec<f64>> = (0..22)
-        .map(|_| (0..36).map(|_| rng.uniform(25.0, 230.0)).collect())
-        .collect();
-    let mut tail1: Vec<Vec<f64>> = (0..80)
-        .map(|_| (0..36).map(|_| rng.uniform(25.0, 230.0)).collect())
-        .collect();
-    let mut tail2: Vec<Vec<f64>> = (0..80)
-        .map(|_| (0..36).map(|_| rng.uniform(25.0, 230.0)).collect())
-        .collect();
-    for (i, vec) in shared_outro.iter().enumerate() {
-        tail1[40 + i] = vec.clone();
-        tail2[44 + i] = vec.clone();
-    }
+    let mut rng = Rng::new(42);
+    let shared_outro: Vec<Vec<f64>> = (0..22).map(|_| rand_vec(&mut rng, 36)).collect();
+    let tail1 = make_episode_vectors(&mut rng, 80, 36, Some(&shared_outro), 40, 0.0);
+    let tail2 = make_episode_vectors(&mut rng, 80, 36, Some(&shared_outro), 44, 0.0);
 
     let (status, det) = srv
         .req_json(
@@ -704,22 +651,8 @@ async fn test_detect_intros_with_tail_fingerprints_saves_outro() {
 #[tokio::test]
 async fn test_library_export_and_import_roundtrip() {
     let srv = TestServer::start().await;
-
-    let (status, created) = srv
-        .req_json(
-            "POST",
-            "/api/shows",
-            Some(json!({
-                "folder_path": srv.show_dir.to_string_lossy(),
-                "name": "Export Show"
-            })),
-        )
-        .await;
-    assert_eq!(status, 201);
-    let show_id = created["show"]["id"].as_str().unwrap().to_string();
-    let eps = created["linked_list"]["episodes"].as_array().unwrap();
-    let ep1_id = eps[0]["id"].as_str().unwrap().to_string();
-    let ep2_id = eps[1]["id"].as_str().unwrap().to_string();
+    let (show_id, ep_ids) = srv.create_show("Export Show").await;
+    let (ep1_id, ep2_id) = (&ep_ids[0], &ep_ids[1]);
 
     // Populate progress, watched state, intro, and outro markers
     let (status, _) = srv
@@ -749,20 +682,10 @@ async fn test_library_export_and_import_roundtrip() {
         .await;
     assert_eq!(status, 200);
 
-    let mut rng = SimpleRng::new(99);
-    let shared_outro: Vec<Vec<f64>> = (0..22)
-        .map(|_| (0..36).map(|_| rng.uniform(25.0, 230.0)).collect())
-        .collect();
-    let mut tail1: Vec<Vec<f64>> = (0..80)
-        .map(|_| (0..36).map(|_| rng.uniform(25.0, 230.0)).collect())
-        .collect();
-    let mut tail2: Vec<Vec<f64>> = (0..80)
-        .map(|_| (0..36).map(|_| rng.uniform(25.0, 230.0)).collect())
-        .collect();
-    for (i, vec) in shared_outro.iter().enumerate() {
-        tail1[42 + i] = vec.clone();
-        tail2[42 + i] = vec.clone();
-    }
+    let mut rng = Rng::new(99);
+    let shared_outro: Vec<Vec<f64>> = (0..22).map(|_| rand_vec(&mut rng, 36)).collect();
+    let tail1 = make_episode_vectors(&mut rng, 80, 36, Some(&shared_outro), 42, 0.0);
+    let tail2 = make_episode_vectors(&mut rng, 80, 36, Some(&shared_outro), 42, 0.0);
     let (status, det) = srv
         .req_json(
             "POST",
@@ -799,18 +722,7 @@ async fn test_library_export_and_import_roundtrip() {
         .await;
     assert_eq!(status, 200);
 
-    let (status, recreated) = srv
-        .req_json(
-            "POST",
-            "/api/shows",
-            Some(json!({
-                "folder_path": srv.show_dir.to_string_lossy(),
-                "name": "Export Show"
-            })),
-        )
-        .await;
-    assert_eq!(status, 201);
-    let new_show_id = recreated["show"]["id"].as_str().unwrap().to_string();
+    let (new_show_id, _) = srv.create_show("Export Show").await;
 
     // Invalid import body returns 400
     let (status, _) = srv
@@ -839,4 +751,165 @@ async fn test_library_export_and_import_roundtrip() {
     assert!((r1["intro_start_sec"].as_f64().unwrap() - 18.0).abs() < 1e-6);
     assert!((r1["intro_end_sec"].as_f64().unwrap() - 78.0).abs() < 1e-6);
     assert!((r1["outro_start_sec"].as_f64().unwrap() - expected_outro).abs() < 1e-3);
+}
+
+#[tokio::test]
+async fn test_detect_intros_two_phase_template_extrapolation() {
+    let srv = TestServer::start().await;
+    fs::write(
+        srv.show_dir.join("S01E03.mp4"),
+        b"THIRD-EPISODE-BYTES-1111111111",
+    )
+    .unwrap();
+    fs::write(
+        srv.show_dir.join("S01E04.mp4"),
+        b"FOURTH-EPISODE-BYTES-222222222",
+    )
+    .unwrap();
+
+    let (show_id, ep_ids) = srv.create_show("Two-Phase Intro Show").await;
+    assert_eq!(ep_ids.len(), 4);
+    let (ep1_id, ep2_id, ep3_id, ep4_id) = (&ep_ids[0], &ep_ids[1], &ep_ids[2], &ep_ids[3]);
+
+    let mut rng = Rng::new(2027);
+    let dim = 84usize;
+
+    // Shared 30s intro at 1.0s step
+    let shared_intro: Vec<Vec<f64>> = (0..30).map(|_| rand_vec(&mut rng, dim)).collect();
+    let ep1_vecs = make_episode_vectors(&mut rng, 120, dim, Some(&shared_intro), 15, 4.0);
+    let ep2_vecs = make_episode_vectors(&mut rng, 120, dim, Some(&shared_intro), 45, 4.0);
+
+    // Phase 1: Discover template from reference episodes Ep1 (15..45s) & Ep2 (45..75s)
+    let (status, phase1) = srv
+        .req_json(
+            "POST",
+            &format!("/api/shows/{show_id}/detect-intros"),
+            Some(json!({
+                "fingerprints": [
+                    { "episode_id": ep1_id, "step_sec": 1.0, "duration_sec": 1320.0, "vectors": ep1_vecs },
+                    { "episode_id": ep2_id, "step_sec": 1.0, "duration_sec": 1320.0, "vectors": ep2_vecs }
+                ],
+                "mark_scanned": false
+            })),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(phase1["detected_count"], 2);
+    assert!(
+        phase1["intro_template"].is_object(),
+        "Phase 1 should return an intro_template object, got: {}",
+        phase1["intro_template"]
+    );
+    let template_vectors = phase1["intro_template"]["vectors"]
+        .as_array()
+        .expect("intro_template.vectors must be an array");
+    assert!(
+        !template_vectors.is_empty(),
+        "intro_template.vectors should be non-empty"
+    );
+    let intro_template = phase1["intro_template"].clone();
+
+    // Phase 2: Extrapolate template to windowed Ep3 (offset_sec=110.0, intro at 120..150s)
+    // and full-scan pilot Ep4 (offset_sec=0.0, no intro).
+    let ep3_window = make_episode_vectors(&mut rng, 50, dim, Some(&shared_intro), 10, 4.0);
+    let ep4_vecs = make_episode_vectors(&mut rng, 120, dim, None, 0, 0.0);
+
+    let (status, phase2) = srv
+        .req_json(
+            "POST",
+            &format!("/api/shows/{show_id}/detect-intros"),
+            Some(json!({
+                "intro_template": intro_template,
+                "fingerprints": [
+                    {
+                        "episode_id": ep3_id,
+                        "step_sec": 1.0,
+                        "offset_sec": 110.0,
+                        "duration_sec": 1320.0,
+                        "vectors": ep3_window
+                    },
+                    {
+                        "episode_id": ep4_id,
+                        "step_sec": 1.0,
+                        "offset_sec": 0.0,
+                        "duration_sec": 1320.0,
+                        "vectors": ep4_vecs
+                    }
+                ],
+                "mark_scanned": true
+            })),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(phase2["detected_count"], 1);
+
+    // Fetch persisted show state to verify Ep3 detected, Ep4 null, and Ep1/Ep2 intact
+    let (status, persisted) = srv
+        .req_json("GET", &format!("/api/shows/{show_id}"), None)
+        .await;
+    assert_eq!(status, 200);
+    let ep_by_id: HashMap<&str, &Value> = persisted["linked_list"]["episodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["id"].as_str().unwrap(), e))
+        .collect();
+
+    let ep3 = ep_by_id[ep3_id.as_str()];
+    let ep3_start = ep3["intro_start_sec"]
+        .as_f64()
+        .expect("ep3 should have persisted intro_start_sec");
+    let ep3_end = ep3["intro_end_sec"]
+        .as_f64()
+        .expect("ep3 should have persisted intro_end_sec");
+    assert!(
+        (ep3_start - 120.0).abs() <= 2.0,
+        "ep3 intro_start_sec expected ~120.0, got {ep3_start:.2}"
+    );
+    assert!(
+        (ep3_end - 150.0).abs() <= 2.0,
+        "ep3 intro_end_sec expected ~150.0, got {ep3_end:.2}"
+    );
+
+    let ep4 = ep_by_id[ep4_id.as_str()];
+    assert!(
+        ep4["intro_start_sec"].is_null(),
+        "pilot ep4 should not have intro_start_sec"
+    );
+    assert!(
+        ep4["intro_end_sec"].is_null(),
+        "pilot ep4 should not have intro_end_sec"
+    );
+
+    let ep1 = ep_by_id[ep1_id.as_str()];
+    let ep1_start = ep1["intro_start_sec"]
+        .as_f64()
+        .expect("ep1 should retain Phase 1 intro_start_sec");
+    let ep1_end = ep1["intro_end_sec"]
+        .as_f64()
+        .expect("ep1 should retain Phase 1 intro_end_sec");
+    assert!(
+        (ep1_start - 15.0).abs() <= 2.0,
+        "ep1 intro_start_sec expected ~15.0, got {ep1_start:.2}"
+    );
+    assert!(
+        (ep1_end - 45.0).abs() <= 2.0,
+        "ep1 intro_end_sec expected ~45.0, got {ep1_end:.2}"
+    );
+
+    let ep2 = ep_by_id[ep2_id.as_str()];
+    let ep2_start = ep2["intro_start_sec"]
+        .as_f64()
+        .expect("ep2 should retain Phase 1 intro_start_sec");
+    let ep2_end = ep2["intro_end_sec"]
+        .as_f64()
+        .expect("ep2 should retain Phase 1 intro_end_sec");
+    assert!(
+        (ep2_start - 45.0).abs() <= 2.0,
+        "ep2 intro_start_sec expected ~45.0, got {ep2_start:.2}"
+    );
+    assert!(
+        (ep2_end - 75.0).abs() <= 2.0,
+        "ep2 intro_end_sec expected ~75.0, got {ep2_end:.2}"
+    );
 }

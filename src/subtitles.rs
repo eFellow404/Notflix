@@ -80,6 +80,7 @@ const LANGUAGE_TABLE: &[(&str, &str, &str)] = &[
 struct DiscoveredSubtitle {
     track: SubtitleTrack,
     is_forced: bool,
+    filename_lower: String,
     path_key: String,
 }
 
@@ -257,6 +258,7 @@ fn collect_matching_files_in_dir(
         }
 
         let (lang, label, is_forced) = parse_language_and_tags(&suffix);
+        let filename_lower = filename.to_lowercase();
         out.push(DiscoveredSubtitle {
             track: SubtitleTrack {
                 index: 0,
@@ -267,8 +269,61 @@ fn collect_matching_files_in_dir(
                 path,
             },
             is_forced,
+            filename_lower,
             path_key,
         });
+    }
+}
+
+/// Scan immediate subtitle subdirectories (`Subs/`, `Subtitles/`, `Sub/`, `CC/`)
+/// and any nested `<sub_dir>/<video_stem>/` folders inside them.
+fn scan_subtitle_subdirs(
+    parent: &Path,
+    video_stem: &str,
+    video_stem_lower: &str,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<DiscoveredSubtitle>,
+) {
+    let Ok(parent_entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+
+    for entry in parent_entries.flatten() {
+        let sub_dir = entry.path();
+        if !sub_dir.is_dir() {
+            continue;
+        }
+        let Some(dir_name) = sub_dir.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !is_subtitle_subdir(dir_name) {
+            continue;
+        }
+
+        collect_matching_files_in_dir(&sub_dir, video_stem, video_stem_lower, false, seen, out);
+
+        let Ok(sub_entries) = std::fs::read_dir(&sub_dir) else {
+            continue;
+        };
+        for sub_entry in sub_entries.flatten() {
+            let nested = sub_entry.path();
+            if !nested.is_dir() {
+                continue;
+            }
+            let Some(nested_name) = nested.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if nested_name.to_lowercase() == video_stem_lower {
+                collect_matching_files_in_dir(
+                    &nested,
+                    video_stem,
+                    video_stem_lower,
+                    true,
+                    seen,
+                    out,
+                );
+            }
+        }
     }
 }
 
@@ -308,53 +363,14 @@ pub fn discover_subtitles(video_path: &Path) -> Vec<SubtitleTrack> {
         &mut discovered,
     );
 
-    // 2. Immediate subtitle subdirectories (`Subs/`, `Subtitles/`, `Sub/`, `CC/`)
-    //    and any nested `<sub_dir>/<video_stem>/` folder inside them.
-    if let Ok(parent_entries) = std::fs::read_dir(parent) {
-        for entry in parent_entries.flatten() {
-            let sub_dir = entry.path();
-            if !sub_dir.is_dir() {
-                continue;
-            }
-            let Some(dir_name) = sub_dir.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if !is_subtitle_subdir(dir_name) {
-                continue;
-            }
-
-            collect_matching_files_in_dir(
-                &sub_dir,
-                video_stem,
-                &video_stem_lower,
-                false,
-                &mut seen,
-                &mut discovered,
-            );
-
-            if let Ok(sub_entries) = std::fs::read_dir(&sub_dir) {
-                for sub_entry in sub_entries.flatten() {
-                    let nested = sub_entry.path();
-                    if !nested.is_dir() {
-                        continue;
-                    }
-                    let Some(nested_name) = nested.file_name().and_then(|s| s.to_str()) else {
-                        continue;
-                    };
-                    if nested_name.to_lowercase() == video_stem_lower {
-                        collect_matching_files_in_dir(
-                            &nested,
-                            video_stem,
-                            &video_stem_lower,
-                            true,
-                            &mut seen,
-                            &mut discovered,
-                        );
-                    }
-                }
-            }
-        }
-    }
+    // 2. Immediate subtitle subdirectories and nested `<sub_dir>/<video_stem>/` folders
+    scan_subtitle_subdirs(
+        parent,
+        video_stem,
+        &video_stem_lower,
+        &mut seen,
+        &mut discovered,
+    );
 
     // Deterministic sort: English first, non-forced before forced, then alphabetical by filename.
     discovered.sort_by(|a, b| {
@@ -363,12 +379,7 @@ pub fn discover_subtitles(video_path: &Path) -> Vec<SubtitleTrack> {
         a_not_en
             .cmp(&b_not_en)
             .then_with(|| a.is_forced.cmp(&b.is_forced))
-            .then_with(|| {
-                a.track
-                    .filename
-                    .to_lowercase()
-                    .cmp(&b.track.filename.to_lowercase())
-            })
+            .then_with(|| a.filename_lower.cmp(&b.filename_lower))
             .then_with(|| a.path_key.cmp(&b.path_key))
     });
 
@@ -380,6 +391,33 @@ pub fn discover_subtitles(video_path: &Path) -> Vec<SubtitleTrack> {
             item.track
         })
         .collect()
+}
+
+/// Normalize CRLF (`\r\n`) and lone CR (`\r`) line endings to `\n` in a single pass.
+fn normalize_line_endings(input: &str) -> String {
+    if !input.contains('\r') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut chunk_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' {
+            out.push_str(&input[chunk_start..i]);
+            out.push('\n');
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            chunk_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&input[chunk_start..]);
+    out
 }
 
 fn is_srt_timestamp(token: &str) -> bool {
@@ -423,7 +461,7 @@ fn convert_timing_line(line: &str) -> Option<String> {
 /// leaving dialogue commas untouched), and prepends `"WEBVTT\n\n"`.
 pub fn srt_to_vtt(srt: &str) -> String {
     let without_bom = srt.strip_prefix('\u{feff}').unwrap_or(srt);
-    let normalized = without_bom.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalize_line_endings(without_bom);
     let body = normalized.trim_start_matches('\n');
 
     let mut out = String::with_capacity(body.len() + 16);
@@ -473,7 +511,7 @@ pub fn load_subtitle_as_vtt(track: &SubtitleTrack) -> Result<String> {
 
     if track.format.eq_ignore_ascii_case("vtt") {
         let without_bom = text.strip_prefix('\u{feff}').unwrap_or(&text);
-        let normalized = without_bom.replace("\r\n", "\n").replace('\r', "\n");
+        let normalized = normalize_line_endings(without_bom);
         if normalized.starts_with("WEBVTT") {
             return Ok(normalized);
         }

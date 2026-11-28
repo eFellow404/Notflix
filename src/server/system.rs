@@ -1,5 +1,8 @@
 //! Health check and Git auto-updater endpoints.
 
+use std::path::Path;
+use std::sync::Arc;
+
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -7,7 +10,6 @@ use axum::response::Response;
 use serde_json::{json, Map, Value};
 
 use crate::error::Result;
-use crate::media::detect_ffmpeg;
 use crate::updater::{
     apply_update_with_fallback, check_for_updates_with_fallback, get_update_mode_info,
     UpdateResult, DEFAULT_FETCH_TIMEOUT_SEC,
@@ -35,15 +37,29 @@ fn cache_and_respond(state: &AppState, res: UpdateResult) -> Response {
     )
 }
 
+async fn run_update_op<F>(state: &AppState, body: &Bytes, op: F) -> Result<Response>
+where
+    F: FnOnce(&Path, bool, f64) -> UpdateResult + Send + 'static,
+{
+    let map = parse_json_object(body)?;
+    let timeout_sec = extract_timeout(&map);
+    let _guard = state.update_lock.lock().await;
+    let repo_dir = state.current_repo_dir();
+    let allow_fallback = state.allow_release_fallback();
+    let res = run_blocking(move || op(&repo_dir, allow_fallback, timeout_sec)).await?;
+    Ok(cache_and_respond(state, res))
+}
+
 pub(super) async fn handle_health(State(state): State<AppState>) -> Response {
     let repo_dir = state.current_repo_dir();
     let allow_fallback = state.allow_release_fallback();
-    let (commit, ffmpeg_available) = run_blocking(move || {
+    let ffmpeg_manager = Arc::clone(&state.ffmpeg_manager);
+    let (commit, ff) = run_blocking(move || {
         let info = get_update_mode_info(&repo_dir, allow_fallback);
-        (info.local_short_sha, detect_ffmpeg())
+        (info.local_short_sha, ffmpeg_manager.snapshot())
     })
     .await
-    .unwrap_or((None, false));
+    .unwrap_or_else(|_| (None, state.ffmpeg_manager.snapshot()));
 
     json_no_store(
         StatusCode::OK,
@@ -52,7 +68,10 @@ pub(super) async fn handle_health(State(state): State<AppState>) -> Response {
             "version": VERSION,
             "build_sha": BUILD_SHA,
             "commit": commit,
-            "ffmpeg_available": ffmpeg_available,
+            "ffmpeg_available": ff.ffmpeg_available,
+            "ffprobe_available": ff.ffprobe_available,
+            "ffmpeg_status": ff.status,
+            "ffmpeg_progress": ff.progress_pct,
         }),
     )
 }
@@ -79,31 +98,20 @@ pub(super) async fn handle_update_check(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<Response> {
-    let map = parse_json_object(&body)?;
-    let timeout_sec = extract_timeout(&map);
-    let _guard = state.update_lock.lock().await;
-    let repo_dir = state.current_repo_dir();
-    let allow_fallback = state.allow_release_fallback();
-    let res = run_blocking(move || {
-        check_for_updates_with_fallback(&repo_dir, allow_fallback, timeout_sec)
-    })
-    .await?;
-    Ok(cache_and_respond(&state, res))
+    run_update_op(&state, &body, check_for_updates_with_fallback).await
 }
 
 pub(super) async fn handle_update_apply(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<Response> {
-    let map = parse_json_object(&body)?;
-    let timeout_sec = extract_timeout(&map);
-    let _guard = state.update_lock.lock().await;
-    let repo_dir = state.current_repo_dir();
-    let allow_fallback = state.allow_release_fallback();
     let db_path = state.store.db_path().to_path_buf();
-    let res = run_blocking(move || {
-        apply_update_with_fallback(&repo_dir, allow_fallback, Some(&db_path), timeout_sec)
-    })
-    .await?;
-    Ok(cache_and_respond(&state, res))
+    run_update_op(
+        &state,
+        &body,
+        move |repo_dir, allow_fallback, timeout_sec| {
+            apply_update_with_fallback(repo_dir, allow_fallback, Some(&db_path), timeout_sec)
+        },
+    )
+    .await
 }

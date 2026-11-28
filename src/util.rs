@@ -13,6 +13,82 @@ pub fn utc_now() -> String {
     Utc::now().to_rfc3339()
 }
 
+/// Parse an optional opt-out boolean flag value.
+///
+/// Returns `true` unless the trimmed, ASCII-lowercased value is `"0"`, `"false"`, `"no"`, or `"off"`.
+pub fn parse_env_flag_enabled(val: Option<&str>) -> bool {
+    !matches!(
+        val.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
+/// Return whether an opt-out environment flag `var` is enabled (defaults to `true` when unset).
+pub fn env_flag_enabled(var: &str) -> bool {
+    let val = std::env::var(var).ok();
+    parse_env_flag_enabled(val.as_deref())
+}
+
+/// Return the trimmed value of environment variable `name`, or `None` if unset or blank.
+pub fn env_var_trimmed(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Convert a timeout in seconds into a [`Duration`], clamping finite values to `[min, max]`
+/// and falling back to `default` for non-finite values.
+pub fn clamp_timeout_secs(raw: f64, min: f64, max: f64, default: f64) -> Duration {
+    let secs = if raw.is_finite() {
+        raw.clamp(min, max)
+    } else {
+        default
+    };
+    Duration::from_secs_f64(secs)
+}
+
+/// Build a configured `ureq::Agent` with explicit connect and read timeouts.
+pub fn build_http_agent(connect_timeout: Duration, read_timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(connect_timeout)
+        .timeout_read(read_timeout)
+        .build()
+}
+
+/// Return the standard Notflix HTTP `User-Agent` header value.
+pub fn http_user_agent() -> String {
+    format!("notflix/{}", crate::VERSION)
+}
+
+/// Validate executable header magic bytes for the specified target OS (`"linux"`, `"windows"`, `"macos"`).
+pub(crate) fn validate_executable_magic_for_os(bytes: &[u8], os: &str) -> bool {
+    match os {
+        "linux" => bytes.starts_with(b"\x7fELF"),
+        "windows" => bytes.starts_with(b"MZ"),
+        "macos" => {
+            bytes.len() >= 4
+                && matches!(
+                    &bytes[..4],
+                    [0xfe, 0xed, 0xfa, 0xce]
+                        | [0xce, 0xfa, 0xed, 0xfe]
+                        | [0xfe, 0xed, 0xfa, 0xcf]
+                        | [0xcf, 0xfa, 0xed, 0xfe]
+                        | [0xca, 0xfe, 0xba, 0xbe]
+                        | [0xbe, 0xba, 0xfe, 0xca]
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Set `0o755` executable permissions on `path` on Unix platforms.
+#[cfg(unix)]
+pub(crate) fn set_executable_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+}
+
 /// Clamp a floating-point value to `>= 0.0`, returning `0.0` for NaN/Inf.
 #[inline]
 pub fn finite_non_negative(value: f64) -> f64 {
@@ -134,6 +210,8 @@ pub fn resolve_path(path: &Path) -> PathBuf {
     lexical_normalize(&abs)
 }
 
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 /// Result of running an external command with a wall-clock timeout.
 pub struct CommandOutcome {
     pub code: i32,
@@ -144,6 +222,26 @@ pub struct CommandOutcome {
 }
 
 impl CommandOutcome {
+    fn spawn_err(err: impl Into<String>) -> Self {
+        Self {
+            code: -1,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+            spawn_error: Some(err.into()),
+        }
+    }
+
+    fn timed_out() -> Self {
+        Self {
+            code: -1,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: true,
+            spawn_error: None,
+        }
+    }
+
     pub fn success(&self) -> bool {
         !self.timed_out && self.spawn_error.is_none() && self.code == 0
     }
@@ -158,6 +256,18 @@ impl CommandOutcome {
         }
         String::from_utf8_lossy(&self.stderr).trim().to_string()
     }
+}
+
+fn spawn_pipe_reader<R: Read + Send + 'static>(
+    pipe: Option<R>,
+) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+    pipe.map(|mut reader| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = reader.read_to_end(&mut buf);
+            buf
+        })
+    })
 }
 
 /// Spawn `cmd`, drain stdout (and optionally stderr) on background threads to avoid OS pipe
@@ -177,31 +287,11 @@ pub fn run_command_with_timeout(
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(err) => {
-            return CommandOutcome {
-                code: -1,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                timed_out: false,
-                spawn_error: Some(err.to_string()),
-            };
-        }
+        Err(err) => return CommandOutcome::spawn_err(err.to_string()),
     };
 
-    let stdout_handle = child.stdout.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let stderr_handle = child.stderr.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
-    });
+    let stdout_handle = spawn_pipe_reader(child.stdout.take());
+    let stderr_handle = spawn_pipe_reader(child.stderr.take());
 
     let deadline = Instant::now() + timeout;
     let code = loop {
@@ -214,27 +304,15 @@ pub fn run_command_with_timeout(
                     let _ = child.wait();
                     // Return immediately without joining pipe reader threads: grandchild
                     // processes (e.g. `git-remote-http`) may still hold inherited pipe FDs.
-                    return CommandOutcome {
-                        code: -1,
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                        timed_out: true,
-                        spawn_error: None,
-                    };
+                    return CommandOutcome::timed_out();
                 }
                 let remaining = deadline.saturating_duration_since(now);
-                std::thread::sleep(remaining.min(Duration::from_millis(20)));
+                std::thread::sleep(remaining.min(CHILD_POLL_INTERVAL));
             }
             Err(err) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return CommandOutcome {
-                    code: -1,
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                    timed_out: false,
-                    spawn_error: Some(err.to_string()),
-                };
+                return CommandOutcome::spawn_err(err.to_string());
             }
         }
     };
@@ -318,5 +396,59 @@ mod tests {
             assert_eq!(expand_tilde_str("~"), home);
             assert_eq!(expand_tilde_str("~/videos"), home.join("videos"));
         }
+    }
+
+    #[test]
+    fn parse_env_flag_enabled_handles_default_truthy_and_falsey() {
+        assert!(parse_env_flag_enabled(None));
+        assert!(parse_env_flag_enabled(Some("")));
+        assert!(parse_env_flag_enabled(Some("1")));
+        assert!(parse_env_flag_enabled(Some("true")));
+        for disabled in ["0", "false", "FALSE", " no ", "Off"] {
+            assert!(!parse_env_flag_enabled(Some(disabled)));
+        }
+    }
+
+    #[test]
+    fn clamp_timeout_secs_clamps_finite_and_falls_back_on_non_finite() {
+        assert_eq!(
+            clamp_timeout_secs(1.0, 5.0, 60.0, 30.0),
+            Duration::from_secs_f64(5.0)
+        );
+        assert_eq!(
+            clamp_timeout_secs(120.0, 5.0, 60.0, 30.0),
+            Duration::from_secs_f64(60.0)
+        );
+        assert_eq!(
+            clamp_timeout_secs(20.0, 5.0, 60.0, 30.0),
+            Duration::from_secs_f64(20.0)
+        );
+        assert_eq!(
+            clamp_timeout_secs(f64::NAN, 5.0, 60.0, 30.0),
+            Duration::from_secs_f64(30.0)
+        );
+        assert_eq!(
+            clamp_timeout_secs(f64::INFINITY, 5.0, 60.0, 30.0),
+            Duration::from_secs_f64(30.0)
+        );
+    }
+
+    #[test]
+    fn validate_executable_magic_checks_all_supported_os_headers() {
+        assert!(validate_executable_magic_for_os(b"\x7fELF\x02", "linux"));
+        assert!(!validate_executable_magic_for_os(b"\x7fEL", "linux"));
+        assert!(validate_executable_magic_for_os(b"MZ", "windows"));
+        assert!(!validate_executable_magic_for_os(b"M", "windows"));
+        for magic in [
+            [0xfe, 0xed, 0xfa, 0xce],
+            [0xce, 0xfa, 0xed, 0xfe],
+            [0xfe, 0xed, 0xfa, 0xcf],
+            [0xcf, 0xfa, 0xed, 0xfe],
+            [0xca, 0xfe, 0xba, 0xbe],
+            [0xbe, 0xba, 0xfe, 0xca],
+        ] {
+            assert!(validate_executable_magic_for_os(&magic, "macos"));
+        }
+        assert!(!validate_executable_magic_for_os(b"\x7fELF", "unknown"));
     }
 }

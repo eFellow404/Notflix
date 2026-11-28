@@ -22,6 +22,117 @@ export const POSTER_GRADIENTS = [
 
 export const byId = (id) => document.getElementById(id);
 
+export function encodePath(id) {
+  return encodeURIComponent(String(id));
+}
+
+export function pluralize(n, singular, plural = `${singular}s`) {
+  return `${n} ${n === 1 ? singular : plural}`;
+}
+
+export function storageGet(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+export function storageSet(key, val) {
+  try {
+    localStorage.setItem(key, String(val));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function withButtonBusy(btn, busyLabel, fn) {
+  if (!btn || btn.disabled) return;
+  const prevText = btn.textContent;
+  btn.disabled = true;
+  if (busyLabel !== null && busyLabel !== undefined) {
+    btn.textContent = busyLabel;
+  }
+  try {
+    return await fn();
+  } finally {
+    btn.disabled = false;
+    if (busyLabel !== null && busyLabel !== undefined && btn.textContent === busyLabel) {
+      btn.textContent = prevText;
+    }
+  }
+}
+
+export async function parseErrorResponse(res, fallback) {
+  const data = await res.json().catch(() => ({}));
+  return data?.error || fallback || `Request failed (${res.status})`;
+}
+
+const BOOL_PROPS = new Set(["disabled", "hidden", "selected", "checked", "draggable"]);
+
+function appendChildSafe(parent, child) {
+  if (child === null || child === undefined || child === false) return;
+  if (Array.isArray(child)) {
+    for (const item of child) appendChildSafe(parent, item);
+  } else if (child instanceof Node) {
+    parent.appendChild(child);
+  } else {
+    parent.appendChild(document.createTextNode(String(child)));
+  }
+}
+
+export function el(tag, attrs = null, ...children) {
+  const node = document.createElement(tag);
+  if (attrs && typeof attrs === "object") {
+    for (const [key, val] of Object.entries(attrs)) {
+      if (val === null || val === undefined || val === false) {
+        if (BOOL_PROPS.has(key)) node[key] = false;
+        continue;
+      }
+      if (key === "className") {
+        node.className = String(val);
+      } else if (key === "text" || key === "textContent") {
+        node.textContent = String(val);
+      } else if (key === "dataset" && typeof val === "object") {
+        for (const [dk, dv] of Object.entries(val)) {
+          if (dv !== null && dv !== undefined && dv !== false) {
+            node.dataset[dk] = String(dv);
+          }
+        }
+      } else if (key === "style") {
+        if (typeof val === "string") {
+          node.style.cssText = val;
+        } else if (typeof val === "object") {
+          Object.assign(node.style, val);
+        }
+      } else if (key === "on" && typeof val === "object") {
+        for (const [evName, handler] of Object.entries(val)) {
+          if (Array.isArray(handler)) {
+            node.addEventListener(evName, handler[0], handler[1]);
+          } else if (typeof handler === "function") {
+            node.addEventListener(evName, handler);
+          }
+        }
+      } else if (key.startsWith("on") && typeof val === "function") {
+        node.addEventListener(key.slice(2).toLowerCase(), val);
+      } else if (BOOL_PROPS.has(key)) {
+        node[key] = Boolean(val);
+      } else if (key === "tabIndex" || key === "value") {
+        node[key] = val;
+      } else if (val === true) {
+        node.setAttribute(key, "");
+      } else {
+        node.setAttribute(key, String(val));
+      }
+    }
+  }
+  for (const child of children) {
+    appendChildSafe(node, child);
+  }
+  return node;
+}
+
 export function formatTime(sec) {
   if (!Number.isFinite(sec) || sec < 0) return "0:00";
   const total = Math.floor(sec);
@@ -69,7 +180,8 @@ export function escapeHtml(str) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 export function showMonogram(name) {
@@ -95,13 +207,14 @@ export function showPosterStyle(name) {
 export function showToast(message, variant = "info") {
   const container = byId("toastContainer");
   if (!container) return;
-  const el = document.createElement("div");
-  el.className = variant === "success" ? "toast toast-success" : "toast";
-  el.textContent = message;
-  container.appendChild(el);
+  const toastEl = el("div", {
+    className: variant === "success" ? "toast toast-success" : "toast",
+    text: message,
+  });
+  container.appendChild(toastEl);
   setTimeout(() => {
-    el.classList.add("toast-exit");
-    setTimeout(() => el.remove(), 240);
+    toastEl.classList.add("toast-exit");
+    setTimeout(() => toastEl.remove(), 240);
   }, 3200);
 }
 

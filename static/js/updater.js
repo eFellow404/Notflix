@@ -1,7 +1,6 @@
-import { api, byId, showToast } from "./utils.js";
+import { api, byId, showToast, withButtonBusy } from "./utils.js";
 
 let lastStatus = null;
-let busy = false;
 
 function renderUpdateButton(info) {
   const btn = byId("updateBtn");
@@ -42,44 +41,39 @@ function renderUpdateButton(info) {
 
 async function handleUpdateClick() {
   const btn = byId("updateBtn");
-  if (!btn || busy) return;
+  if (!btn) return;
 
   if (lastStatus?.status === "updated") {
     window.location.reload();
     return;
   }
 
-  busy = true;
-  btn.disabled = true;
   const shouldApply = lastStatus?.status === "update_available";
-  btn.textContent = shouldApply ? "Updating…" : "Checking…";
+  await withButtonBusy(btn, shouldApply ? "Updating…" : "Checking…", async () => {
+    try {
+      const endpoint = shouldApply ? "/api/update/apply" : "/api/update/check";
+      const res = await api(endpoint, { method: "POST", body: "{}" });
+      lastStatus = res;
+      renderUpdateButton(res);
 
-  try {
-    const endpoint = shouldApply ? "/api/update/apply" : "/api/update/check";
-    const res = await api(endpoint, { method: "POST", body: "{}" });
-    lastStatus = res;
-    renderUpdateButton(res);
-
-    if (res.status === "updated") {
-      const backupNote = res.backup_path ? " Database backed up." : "";
-      showToast(
-        `${res.message}${backupNote} Restart Notflix (or click Reload) to use the latest version.`,
-        "success"
-      );
-    } else if (res.status === "update_available") {
-      showToast(`${res.message} Click "↑ Update" to install.`);
-    } else if (res.status === "up_to_date") {
-      showToast(res.message, "success");
-    } else {
-      showToast(res.message || "Could not check for updates right now.");
+      if (res.status === "updated") {
+        const backupNote = res.backup_path ? " Database backed up." : "";
+        showToast(
+          `${res.message}${backupNote} Restart Notflix (or click Reload) to use the latest version.`,
+          "success"
+        );
+      } else if (res.status === "update_available") {
+        showToast(`${res.message} Click "↑ Update" to install.`);
+      } else if (res.status === "up_to_date") {
+        showToast(res.message, "success");
+      } else {
+        showToast(res.message || "Could not check for updates right now.");
+      }
+    } catch (err) {
+      showToast(`Update check failed: ${err.message}`);
+      renderUpdateButton(lastStatus || { status: "idle" });
     }
-  } catch (err) {
-    showToast(`Update check failed: ${err.message}`);
-    renderUpdateButton(lastStatus || { status: "idle" });
-  } finally {
-    busy = false;
-    btn.disabled = false;
-  }
+  });
 }
 
 export async function initUpdater() {

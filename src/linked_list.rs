@@ -332,10 +332,20 @@ impl EpisodeLinkedList {
 
     /// Return the zero-based position of `episode_id` in the list, or `None` if absent.
     pub fn index_of(&self, episode_id: &str) -> Option<usize> {
-        if !self.index.contains_key(episode_id) {
-            return None;
+        let target_idx = *self.index.get(episode_id)?;
+        let mut cursor = self.head;
+        let mut pos = 0;
+        while let Some(slot_idx) = cursor {
+            if pos >= self.length {
+                break;
+            }
+            if slot_idx == target_idx {
+                return Some(pos);
+            }
+            cursor = self.slot(slot_idx)?.next;
+            pos += 1;
         }
-        self.iter().position(|node| node.id == episode_id)
+        None
     }
 
     /// Set the active episode pointer to `episode_id` in O(1).
@@ -488,6 +498,18 @@ impl EpisodeLinkedList {
         }
     }
 
+    /// Iterate over episodes in forward order alongside their `prev_id` and `next_id` links
+    /// read directly from arena slots without hash lookups.
+    pub(crate) fn iter_with_links(
+        &self,
+    ) -> impl Iterator<Item = (&EpisodeNode, Option<&str>, Option<&str>)> {
+        LinkedIter {
+            list: self,
+            cursor: self.head,
+            remaining: self.length,
+        }
+    }
+
     /// Clone all episodes into a `Vec` in forward order.
     pub fn to_vec(&self) -> Vec<EpisodeNode> {
         self.iter().cloned().collect()
@@ -631,20 +653,22 @@ impl EpisodeLinkedList {
         }
 
         let mut ordered = Vec::with_capacity(by_id.len());
-        let mut cursor_id = head_id.map(str::to_string);
+        let mut cursor_id: Option<&str> = head_id;
 
         while let Some(cid) = cursor_id {
-            let Some(node) = by_id.remove(&cid) else {
+            let Some(node) = by_id.remove(cid) else {
                 break;
             };
             ordered.push(node);
-            cursor_id = next_map.get(&cid).and_then(|opt| opt.clone());
+            cursor_id = next_map.get(cid).and_then(Option::as_deref);
         }
 
         // Recover any orphaned nodes deterministically
-        for id in original_order {
-            if let Some(node) = by_id.remove(&id) {
-                ordered.push(node);
+        if !by_id.is_empty() {
+            for id in original_order {
+                if let Some(node) = by_id.remove(&id) {
+                    ordered.push(node);
+                }
             }
         }
 
@@ -679,6 +703,37 @@ impl<'a> Iterator for ListIter<'a> {
 }
 
 impl ExactSizeIterator for ListIter<'_> {}
+
+struct LinkedIter<'a> {
+    list: &'a EpisodeLinkedList,
+    cursor: Option<usize>,
+    remaining: usize,
+}
+
+impl<'a> Iterator for LinkedIter<'a> {
+    type Item = (&'a EpisodeNode, Option<&'a str>, Option<&'a str>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let idx = self.cursor?;
+        let slot = self.list.slot(idx)?;
+        self.cursor = slot.next;
+        self.remaining -= 1;
+        Some((
+            &slot.node,
+            self.list.slot_id(slot.prev),
+            self.list.slot_id(slot.next),
+        ))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for LinkedIter<'_> {}
 
 #[cfg(test)]
 mod tests {
@@ -775,5 +830,36 @@ mod tests {
         assert_eq!(list.free_list.len(), 3);
         assert_eq!(list.current_id(), Some("fresh-1"));
         assert!(list.validate_invariants());
+    }
+
+    #[test]
+    fn iter_with_links_index_of_and_from_persisted_match_structure() {
+        let mut next_map = HashMap::new();
+        next_map.insert("ep2".to_string(), Some("ep1".to_string()));
+        next_map.insert("ep1".to_string(), None);
+
+        let list = EpisodeLinkedList::from_persisted(
+            vec![make_node("ep1"), make_node("ep2"), make_node("orphan")],
+            &next_map,
+            Some("ep2"),
+            Some("ep1"),
+        );
+
+        let links: Vec<(&str, Option<&str>, Option<&str>)> = list
+            .iter_with_links()
+            .map(|(n, prev, next)| (n.id.as_str(), prev, next))
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                ("ep2", None, Some("ep1")),
+                ("ep1", Some("ep2"), Some("orphan")),
+                ("orphan", Some("ep1"), None),
+            ]
+        );
+        assert_eq!(list.index_of("ep2"), Some(0));
+        assert_eq!(list.index_of("ep1"), Some(1));
+        assert_eq!(list.index_of("orphan"), Some(2));
+        assert_eq!(list.index_of("missing"), None);
     }
 }

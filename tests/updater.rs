@@ -1,15 +1,19 @@
 //! Integration tests for the offline-safe automatic Git updater and SQLite DB backups.
 
+mod common;
+
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
+use common::{
+    assert_is_executable, create_show_folder, fake_valid_binary_for_os, unused_local_port,
+    MockHttpServer, MockResponse,
+};
 use notflix::storage::NotflixStore;
 use notflix::updater::{
     apply_release_update_to_path, apply_update, auto_update_on_startup, backup_database,
@@ -90,9 +94,7 @@ fn check_and_apply_update_fast_forwards_and_preserves_user_db() {
     // Create realistic Notflix user database (inside repo to prove untracked DB is never wiped!)
     let db_path = local_dir.join("user_notflix.db");
     let show_dir = base.join("MyShow");
-    fs::create_dir(&show_dir).expect("create show dir");
-    fs::write(show_dir.join("S01E01 - Pilot.mp4"), b"video1").expect("write video1");
-    fs::write(show_dir.join("S01E02 - Next.mp4"), b"video2").expect("write video2");
+    create_show_folder(&show_dir, &["S01E01 - Pilot.mp4", "S01E02 - Next.mp4"]);
 
     let store = NotflixStore::new(Some(db_path.clone())).expect("create store");
     let (show, ll) = store
@@ -396,141 +398,50 @@ fn release_matches_build_checks_tag_and_commitish() {
     ));
 }
 
-struct MockReleaseServer {
-    addr: SocketAddr,
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl MockReleaseServer {
-    fn start(tag: &str, asset_name: &str, valid_binary: Vec<u8>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock release server");
-        let addr = listener.local_addr().expect("mock server addr");
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_flag = Arc::clone(&stop);
-
-        let tag = tag.to_string();
-        let asset_name = asset_name.to_string();
-
-        let handle = std::thread::spawn(move || {
-            let base = format!("http://{addr}");
-            let valid_json = serde_json::json!({
-                "tag_name": tag,
-                "name": format!("Notflix {tag}"),
-                "target_commitish": "main",
-                "assets": [
-                    {
-                        "name": asset_name,
-                        "browser_download_url": format!("{base}/download/valid")
-                    }
-                ]
-            })
-            .to_string();
-
-            let corrupt_json = serde_json::json!({
-                "tag_name": tag,
-                "name": format!("Notflix {tag}"),
-                "target_commitish": "main",
-                "assets": [
-                    {
-                        "name": asset_name,
-                        "browser_download_url": format!("{base}/download/corrupt")
-                    }
-                ]
-            })
-            .to_string();
-
-            while !stop_flag.load(Ordering::Relaxed) {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    break;
-                };
-                if stop_flag.load(Ordering::Relaxed) {
-                    break;
-                }
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let mut req_buf = [0u8; 4096];
-                let n = stream.read(&mut req_buf).unwrap_or(0);
-                let req_text = String::from_utf8_lossy(&req_buf[..n]);
-                let path = req_text
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .unwrap_or("/");
-
-                let (status_line, content_type, body): (&str, &str, &[u8]) = match path {
-                    "/releases/latest" => {
-                        ("HTTP/1.1 200 OK", "application/json", valid_json.as_bytes())
-                    }
-                    "/releases/corrupt" => (
-                        "HTTP/1.1 200 OK",
-                        "application/json",
-                        corrupt_json.as_bytes(),
-                    ),
-                    "/download/valid" => (
-                        "HTTP/1.1 200 OK",
-                        "application/octet-stream",
-                        valid_binary.as_slice(),
-                    ),
-                    "/download/corrupt" => (
-                        "HTTP/1.1 200 OK",
-                        "text/html",
-                        b"<html><body>corrupted download</body></html>",
-                    ),
-                    _ => ("HTTP/1.1 404 Not Found", "text/plain", b"not found"),
-                };
-
-                let header = format!(
-                    "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(header.as_bytes());
-                let _ = stream.write_all(body);
-                let _ = stream.flush();
-            }
-        });
-
-        Self {
-            addr,
-            stop,
-            handle: Some(handle),
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("http://{}{}", self.addr, path)
-    }
-}
-
-impl Drop for MockReleaseServer {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let _ = TcpStream::connect(self.addr);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-fn fake_valid_binary_for_current_os() -> Vec<u8> {
-    let mut bytes = match std::env::consts::OS {
-        "linux" => vec![0x7f, b'E', b'L', b'F'],
-        "windows" => vec![b'M', b'Z', 0x90, 0x00],
-        "macos" => vec![0xcf, 0xfa, 0xed, 0xfe],
-        _ => vec![0x7f, b'E', b'L', b'F'],
-    };
-    bytes.extend_from_slice(b"-notflix-updated-release-binary-v2");
-    bytes
-}
-
 #[test]
 fn check_and_apply_release_update_with_mock_server() {
     let Some(asset_name) = release_asset_name() else {
         return;
     };
 
-    let expected_binary = fake_valid_binary_for_current_os();
+    let expected_binary = fake_valid_binary_for_os(std::env::consts::OS, 64);
     let tag = "build-20261127-023000-4952bb1";
-    let server = MockReleaseServer::start(tag, asset_name, expected_binary.clone());
+    let tag_owned = tag.to_string();
+    let asset_owned = asset_name.to_string();
+    let binary_for_server = expected_binary.clone();
+    let server = MockHttpServer::start_with_base(move |path, base| match path {
+        "/releases/latest" => MockResponse::ok(
+            serde_json::json!({
+                "tag_name": tag_owned,
+                "name": format!("Notflix {tag_owned}"),
+                "target_commitish": "main",
+                "assets": [{
+                    "name": asset_owned,
+                    "browser_download_url": format!("{base}/download/valid")
+                }]
+            })
+            .to_string(),
+            "application/json",
+        ),
+        "/releases/corrupt" => MockResponse::ok(
+            serde_json::json!({
+                "tag_name": tag_owned,
+                "name": format!("Notflix {tag_owned}"),
+                "target_commitish": "main",
+                "assets": [{
+                    "name": asset_owned,
+                    "browser_download_url": format!("{base}/download/corrupt")
+                }]
+            })
+            .to_string(),
+            "application/json",
+        ),
+        "/download/valid" => MockResponse::binary(binary_for_server.clone()),
+        "/download/corrupt" => {
+            MockResponse::ok(b"<html><body>corrupted download</body></html>", "text/html")
+        }
+        _ => MockResponse::with_status(404, b"not found", "text/plain"),
+    });
     let latest_url = server.url("/releases/latest");
     let corrupt_url = server.url("/releases/corrupt");
 
@@ -582,16 +493,7 @@ fn check_and_apply_release_update_with_mock_server() {
 
     let replaced_bytes = fs::read(&target_exe).expect("read updated binary");
     assert_eq!(replaced_bytes, expected_binary);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&target_exe)
-            .expect("metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o111, 0o111, "updated binary must be executable");
-    }
+    assert_is_executable(&target_exe);
 
     // 4. Corrupt / non-magic payload is rejected safely without modifying target_exe
     let safe_exe = tmp.path().join("notflix-safe-bin");
@@ -608,10 +510,7 @@ fn check_and_apply_release_update_with_mock_server() {
 
 #[test]
 fn check_release_updates_unreachable_port_returns_offline() {
-    // Bind and immediately drop a listener to guarantee an unused local port
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
+    let port = unused_local_port();
 
     let url = format!("http://127.0.0.1:{port}/releases/latest");
     let res = check_release_updates_from_url(&url, "1111111", 2.0);

@@ -1,8 +1,11 @@
 //! Integration tests for SQLite persistence, linked-list roundtrip, and rescan retention.
 
+mod common;
+
 use std::collections::HashMap;
 use std::fs;
 
+use common::create_show_folder;
 use notflix::intro_detector::IntroSpan;
 use notflix::storage::NotflixStore;
 use rusqlite::Connection;
@@ -13,14 +16,14 @@ fn add_persist_progress_and_rescan_preserves_timeplace() {
     let tmp = tempdir().expect("tempdir");
     let base = tmp.path();
     let show_dir = base.join("Firefly");
-    fs::create_dir(&show_dir).expect("create show dir");
-    for name in [
-        "S01E02 - The Train Job.mp4",
-        "S01E01 - Serenity.mp4",
-        "S01E03 - Bushwhacked.mp4",
-    ] {
-        fs::write(show_dir.join(name), b"video").expect("write video");
-    }
+    create_show_folder(
+        &show_dir,
+        &[
+            "S01E02 - The Train Job.mp4",
+            "S01E01 - Serenity.mp4",
+            "S01E03 - Bushwhacked.mp4",
+        ],
+    );
 
     let db_path = base.join("notflix.db");
     let store = NotflixStore::new(Some(db_path.clone())).expect("create store");
@@ -106,10 +109,10 @@ fn manual_reorder_persists_and_reset_restores_smart_order() {
     let tmp = tempdir().expect("tempdir");
     let base = tmp.path();
     let show_dir = base.join("MiniShow");
-    fs::create_dir(&show_dir).expect("create show dir");
-    for i in [1, 2, 3] {
-        fs::write(show_dir.join(format!("Episode {i}.mp4")), b"video").expect("write video");
-    }
+    create_show_folder(
+        &show_dir,
+        &["Episode 1.mp4", "Episode 2.mp4", "Episode 3.mp4"],
+    );
 
     let store = NotflixStore::new(Some(base.join("db.sqlite"))).expect("create store");
     let (show, ll) = store
@@ -201,9 +204,7 @@ fn intro_persistence_migration_and_rescan_preservation() {
     }
 
     let show_dir = base.join("IntroShow");
-    fs::create_dir(&show_dir).expect("create show dir");
-    fs::write(show_dir.join("S01E01.mp4"), b"video").expect("write ep1");
-    fs::write(show_dir.join("S01E02.mp4"), b"video").expect("write ep2");
+    create_show_folder(&show_dir, &["S01E01.mp4", "S01E02.mp4"]);
 
     let store = NotflixStore::new(Some(db_path)).expect("open migrated store");
     let (show, ll) = store
@@ -300,24 +301,21 @@ fn list_shows_returns_accurate_stats_across_multiple_shows() {
     let base = tmp.path();
 
     let show_a_dir = base.join("ShowAlpha");
-    fs::create_dir(&show_a_dir).expect("create ShowAlpha");
-    for name in [
-        "S01E01 - Pilot.mp4",
-        "S01E02 - Second.mp4",
-        "S02E01 - Return.mp4",
-        "Behind The Scenes Extra.mp4",
-    ] {
-        fs::write(show_a_dir.join(name), b"video").expect("write video");
-    }
+    create_show_folder(
+        &show_a_dir,
+        &[
+            "S01E01 - Pilot.mp4",
+            "S01E02 - Second.mp4",
+            "S02E01 - Return.mp4",
+            "Behind The Scenes Extra.mp4",
+        ],
+    );
 
     let show_b_dir = base.join("ShowBeta");
-    fs::create_dir(&show_b_dir).expect("create ShowBeta");
-    for name in ["S01E01.mp4", "S01E02.mp4"] {
-        fs::write(show_b_dir.join(name), b"video").expect("write video");
-    }
+    create_show_folder(&show_b_dir, &["S01E01.mp4", "S01E02.mp4"]);
 
     let show_c_dir = base.join("ShowEmpty");
-    fs::create_dir(&show_c_dir).expect("create ShowEmpty");
+    create_show_folder(&show_c_dir, &[]);
 
     let store = NotflixStore::new(Some(base.join("multi.db"))).expect("create store");
     let (show_a, ll_a) = store
@@ -466,9 +464,7 @@ fn outro_migration_save_preserve_manual_and_rescan() {
 
     // Add a real folder show and verify save_show_outros + preserve_manual + rescan preservation
     let show_dir = base.join("OutroShow");
-    fs::create_dir(&show_dir).expect("create OutroShow");
-    fs::write(show_dir.join("S01E01.mp4"), b"video").expect("write ep1");
-    fs::write(show_dir.join("S01E02.mp4"), b"video").expect("write ep2");
+    create_show_folder(&show_dir, &["S01E01.mp4", "S01E02.mp4"]);
 
     let (show, ll) = store
         .add_show(show_dir.to_str().unwrap(), None)
@@ -560,10 +556,14 @@ fn watch_history_export_and_cross_os_import_roundtrip() {
 
     // Source library on machine A
     let src_dir = base.join("machine_a").join("Cowboy Bebop");
-    fs::create_dir_all(src_dir.join("Season 1")).expect("create src Season 1");
-    fs::write(src_dir.join("Season 1").join("S01E01.mp4"), b"video").expect("write ep1");
-    fs::write(src_dir.join("Season 1").join("S01E02.mp4"), b"video").expect("write ep2");
-    fs::write(src_dir.join("Season 1").join("S01E03.mp4"), b"video").expect("write ep3");
+    create_show_folder(
+        &src_dir,
+        &[
+            "Season 1/S01E01.mp4",
+            "Season 1/S01E02.mp4",
+            "Season 1/S01E03.mp4",
+        ],
+    );
 
     let store_a = NotflixStore::new(Some(base.join("a.db"))).expect("create store A");
     let (show_a, ll_a) = store_a
@@ -672,10 +672,14 @@ fn watch_history_export_and_cross_os_import_roundtrip() {
 
     // Target library on machine B with completely different path
     let dst_dir = base.join("machine_b").join("anime_folder");
-    fs::create_dir_all(dst_dir.join("season 1")).expect("create dst season 1");
-    fs::write(dst_dir.join("season 1").join("S01E01.mp4"), b"video").expect("write dst ep1");
-    fs::write(dst_dir.join("season 1").join("S01E02.mp4"), b"video").expect("write dst ep2");
-    fs::write(dst_dir.join("season 1").join("S01E03.mp4"), b"video").expect("write dst ep3");
+    create_show_folder(
+        &dst_dir,
+        &[
+            "season 1/S01E01.mp4",
+            "season 1/S01E02.mp4",
+            "season 1/S01E03.mp4",
+        ],
+    );
 
     let store_b = NotflixStore::new(Some(base.join("b.db"))).expect("create store B");
     let (show_b, _) = store_b

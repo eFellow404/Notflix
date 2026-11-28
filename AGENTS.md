@@ -17,19 +17,20 @@ This document is the authoritative reference for future AI agents and contributo
 | --- | --- |
 | `build.rs` | Embeds 7-char `NOTFLIX_BUILD_SHA` at compile time |
 | `src/lib.rs` | Crate exports (`VERSION`, `BUILD_SHA`, `open_browser`, `strip_windows_verbatim_prefix`) |
-| `src/main.rs` | CLI (`clap`), startup `.old` cleanup, startup auto-update + seamless self-relaunch, auto-open browser, Axum server bootstrap |
+| `src/main.rs` | CLI (`clap`), startup `.old` cleanup, startup auto-update + seamless self-relaunch, background `ffmpeg`/`ffprobe` provisioning, auto-open browser, Axum server bootstrap |
 | `src/util.rs` | Path canonicalization, Windows `\\?\` stripping, `~` expansion, timeout-safe subprocess runner (non-blocking on grandchild pipes), cross-platform `open_browser` |
 | `src/error.rs` | `NotflixError` & HTTP error responses |
-| `src/intelligence.rs` | Recursive folder scanning & intelligent DVD-rip episode ordering |
+| `src/intelligence/` | Recursive folder scanning & intelligent DVD-rip episode ordering (`mod.rs`, `patterns.rs`, `consensus.rs`) |
 | `src/linked_list.rs` | Arena-backed `EpisodeLinkedList` doubly linked list (`head`, `tail`, `current`, `prev`/`next`, `free_list` O(1) reuse) |
-| `src/storage.rs` | SQLite WAL persistence, non-destructive `ALTER TABLE` migrations, lock-free disk rescanning, portable JSON watch-history export/import |
-| `src/media.rs` | HTTP 206 byte-range video streaming (256 KiB chunks), `ffprobe` audio stream inspection, on-the-fly `ffmpeg` fragmented-MP4 audio remux streaming, show poster & episode thumbnail discovery/caching |
+| `src/storage/` | SQLite WAL persistence (`mod.rs`, `schema.rs`, `shows.rs`, `episodes.rs`, `history.rs`): non-destructive `ALTER TABLE` migrations, lock-free disk rescanning, portable JSON watch-history export/import |
+| `src/ffmpeg_bin.rs` | Managed `ffmpeg`/`ffprobe` binary resolution (`NOTFLIX_FFMPEG_PATH`/`NOTFLIX_FFPROBE_PATH` → system `PATH` → `~/.notflix/bin/`), background first-run downloader with ELF/Mach-O/PE magic-byte validation, atomic `.part` staging, stale partial cleanup, and offline-safe status tracking |
+| `src/media/` | Media delivery & inspection (`mod.rs`, `streaming.rs`, `probe.rs`, `artwork.rs`): HTTP 206 byte-range video streaming (256 KiB chunks), `ffprobe` audio stream inspection, on-the-fly `ffmpeg` fragmented-MP4 audio remux streaming, show poster & episode thumbnail discovery/caching |
 | `src/subtitles.rs` | Subtitle `.srt`/`.vtt` discovery (same folder + `Subs/`/`Subtitles/` + nested stem folders), language/tag parsing, pure-Rust SRT→WebVTT conversion (UTF-8 & Latin-1) |
-| `src/chapters.rs` | Pure-Rust MKV (EBML) and MP4 (`chpl`/`trak`) chapter parser + intro & outro chapter classifiers |
-| `src/intro_detector/` | Modular intro & outro fingerprinting (`mod.rs`, `audio.rs`, `matching.rs`): 16-band Goertzel + CMN audio vectors, Kadane gap-debt hard split (`MAX_INTERIOR_MISMATCH_SEC = 3.0`), `best_contiguous_subrun()`, multi-episode consensus trimming, tail outro matching |
-| `src/updater.rs` | Dual-mode offline-safe updater: Git fast-forward updater + GitHub Releases standalone binary updater, WAL-safe SQLite backups, ELF/PE/Mach-O magic-byte validation, atomic binary swap & `.old` cleanup |
-| `src/server/` | Modular Axum router (`mod.rs`, `shows.rs`, `episodes.rs`, `assets.rs`, `system.rs`) |
-| `static/` | Embedded web UI (`index.html`, `styles.css`, `app.js`, `js/{state,utils,api,library,sidebar,player,intro,modals,updater}.js`) |
+| `src/chapters/` | Pure-Rust MKV (EBML) and MP4 (`chpl`/`trak`) chapter parser + intro & outro chapter classifiers (`mod.rs`, `mkv.rs`, `mp4.rs`) |
+| `src/intro_detector/` | Modular intro & outro fingerprinting (`mod.rs`, `audio.rs`, `matching/{mod,pairwise,consensus,template}.rs`): 24-band Goertzel + CMN audio vectors (with short-episode scan cap), 5s block cross-episode discovery, adaptive background thresholding, exact multi-episode consensus (`P(k)`) boundary refinement, two-phase `IntroTemplate` discovery & windowed (`offset_sec`) extrapolation, tail outro matching |
+| `src/updater/` | Dual-mode offline-safe updater (`mod.rs`, `backup.rs`, `git.rs`, `release.rs`, `startup.rs`): Git fast-forward updater + GitHub Releases standalone binary updater, WAL-safe SQLite backups, ELF/PE/Mach-O magic-byte validation, atomic binary swap & `.old` cleanup |
+| `src/server/` | Modular Axum router (`mod.rs`, `shows.rs`, `intros.rs`, `episodes.rs`, `assets.rs`, `system.rs`) |
+| `static/` | Embedded web UI (`index.html`, `styles.css`, `app.js`, `js/{state,utils,library,library-modals,sidebar,seasons,player,player-tracks,player-controls,intro,intro-visual,updater}.js` — `intro-visual.js` is lazy-loaded only when client visual scan is needed) |
 
 ---
 
@@ -38,7 +39,7 @@ This document is the authoritative reference for future AI agents and contributo
 ### A. Plain-Folder Library & Intelligent Episode Ordering
 - Add any local folder via the built-in server-side filesystem browser (`GET /api/fs/browse`) or by pasting a path (`POST /api/shows`).
 - Supports flat folders and nested `Season` / `Disc` / `Bonus` directory layouts.
-- Intelligent filename/folder parser (`src/intelligence.rs`) handles:
+- Intelligent filename/folder parser (`src/intelligence/`) handles:
   - `S01E02`, `1x02`, `Season 1 Episode 2`, `Ep 02`, `Part 2`
   - MakeMKV disc rips (`Disc 1/title_t00.mkv`, `D1_T02`), DVD `VTS_01_1.VOB`
   - 3-digit `SEE` codes (`101`, `201`) with sibling consensus
@@ -68,9 +69,10 @@ This document is the authoritative reference for future AI agents and contributo
 ### E. Automatic Intro & Outro (Credits) Detection
 - **3-Tier Intro Detection** (`POST /api/shows/{id}/detect-intros`):
   1. Pure-Rust embedded MKV/MP4 chapter markers (`Opening`, `Intro`, `OP`, `Theme Song`).
-  2. Optional `ffmpeg` 16-band Goertzel + Cepstral Mean Normalization (CMN) audio fingerprinting.
-  3. Zero-dependency browser visual frame fingerprinting (6×4 12%-cropped grid at 1.0s step via `static/js/intro.js`).
-- Hard interior mismatch guard (`MAX_INTERIOR_MISMATCH_SEC = 3.0`, leaky gap debt + `best_contiguous_subrun()`) prevents opening studio logos/fanfares from bridging across cold opens into the intro; multi-episode consensus trimming + 2-frame edge trim ensure tight intro boundaries.
+  2. Optional `ffmpeg` 24-band Goertzel + Cepstral Mean Normalization (CMN) audio fingerprinting (with a short-episode scan cap).
+  3. Zero-dependency browser visual frame fingerprinting (`8×6` Luma + `4×3` per-channel Chroma vectors via `static/js/intro-visual.js`, lazy-loaded by `static/js/intro.js`).
+- **Precision Zero-Bleed Boundary Matching**: 5-second block cross-episode discovery + adaptive background thresholding + exact multi-episode consensus (`P(k)`) boundary refinement prevent pre-intro and post-intro bleed (including correlated color-cast footage, opening bumpers/fanfares, and adjacent fades/coincidental frames) without any ±1 halo expansion.
+- **Two-Phase Reference-to-All-Episodes Extrapolation**: Discovers a reusable `IntroTemplate` (`discover_intro_template`) on reference episodes and extrapolates it to every remaining episode via `match_episodes_against_template` (supporting windowed `offset_sec` scans and removing the old 24-episode cap). In the browser, non-reference episodes run a fast 5s coarse probe followed by a fine verification window around candidate matches.
 - Fullscreen **Skip Intro** overlay (`S` shortcut), highlighted seekbar intro segment, and manual intro start/end editor (`PATCH /api/episodes/{id}/intro`).
 - **Outro / Credits Detection** for Smart **Up Next**:
   - Persists `outro_start_sec` and `outro_source` in SQLite via non-destructive migration.
@@ -106,6 +108,13 @@ This document is the authoritative reference for future AI agents and contributo
 - **Offline-Safe**: Network errors, DNS failures, timeouts, and 5xx/rate-limits degrade cleanly to `status: "offline"` and never block startup.
 - **In-App Controls**: `↻ Updates` button (`GET /api/update/status`, `POST /api/update/check`, `POST /api/update/apply`).
 
+### K. Automatic First-Run `ffmpeg` & `ffprobe` Download
+- **Non-Blocking Background Provisioning** (`src/ffmpeg_bin.rs`): On startup (unless disabled via `--no-ffmpeg-download` or `NOTFLIX_AUTO_FFMPEG=0`), if `ffmpeg` or `ffprobe` is not already available via explicit environment overrides or system `PATH`, Notflix downloads the missing platform binaries in the background into `~/.notflix/bin/` (configurable via `NOTFLIX_FFMPEG_DIR`).
+- **Resolution Priority**: `NOTFLIX_FFMPEG_PATH` / `NOTFLIX_FFPROBE_PATH` → system `PATH` → managed `~/.notflix/bin/`.
+- **Validation & Atomic Staging**: Streams binaries with size bounds, validates ELF (Linux), Mach-O / fat (macOS), or PE (Windows) magic bytes, writes to temporary `.part.` files before atomically renaming into place (`0o755` on Unix), and cleans up stale `.part.` files from interrupted runs.
+- **Offline-Safe Fallback**: Network failures, unreachable hosts, and invalid/truncated responses fail cleanly without blocking startup or leaving partial files behind; direct playback, embedded chapters, and browser visual intro/outro detection continue to work seamlessly.
+- **UI Wait Coordination**: Download status and progress are reported via `GET /api/health` (`ffmpeg_status`, `ffmpeg_available`, `ffprobe_available`), allowing the web UI to coordinate and wait for an active `ffmpeg` download during intro detection before falling back to browser visual fingerprinting.
+
 ---
 
 ## 3. CLI Flags & Environment Variables
@@ -118,6 +127,7 @@ This document is the authoritative reference for future AI agents and contributo
 - `--no-open` (do not auto-open browser on startup)
 - `--quiet` (suppress HTTP access logs)
 - `--no-auto-update` (skip startup auto-update check)
+- `--no-ffmpeg-download` (skip automatic background download of `ffmpeg` and `ffprobe`)
 - `--check-update` (check remote update status, print result, and exit)
 - `--update-timeout <SEC>` (network timeout in seconds, default `5.0`)
 
@@ -127,12 +137,17 @@ This document is the authoritative reference for future AI agents and contributo
 - `NOTFLIX_UPDATE_MODE=auto|git|release` — force Git or GitHub Releases update mode
 - `NOTFLIX_RELEASE_REPO=owner/repo` — override GitHub Releases repository (default `eFellow404/Notflix`)
 - `NOTFLIX_RELAUNCHED=1` — internal loop guard set automatically after startup self-relaunch
+- `NOTFLIX_AUTO_FFMPEG=0|false|no|off` — disable automatic first-run `ffmpeg`/`ffprobe` download
+- `NOTFLIX_FFMPEG_DIR=<DIR>` — override managed `ffmpeg`/`ffprobe` binary directory (default `~/.notflix/bin`)
+- `NOTFLIX_FFMPEG_PATH=<PATH>` — explicit path override for the `ffmpeg` binary
+- `NOTFLIX_FFPROBE_PATH=<PATH>` — explicit path override for the `ffprobe` binary
+- `NOTFLIX_FFMPEG_BASE_URL=<URL>` — override base URL for downloading `ffmpeg`/`ffprobe` binaries
 
 ---
 
 ## 4. Complete REST API Route Map
 
-- `GET /api/health` — `{ status, version, build_sha, commit, ffmpeg_available }`
+- `GET /api/health` — `{ status, version, build_sha, commit, ffmpeg_available, ffprobe_available, ffmpeg_status, ffmpeg_progress }` (includes live managed `ffmpeg`/`ffprobe` download state and progress)
 - `GET /api/update/status` | `POST /api/update/check` | `POST /api/update/apply`
 - `GET /api/fs/browse?path=...`
 - `GET /api/library/export` | `POST /api/library/import`
@@ -142,7 +157,7 @@ This document is the authoritative reference for future AI agents and contributo
 - `POST /api/shows/{id}/rescan`
 - `POST /api/shows/{id}/next` | `POST /api/shows/{id}/prev` | `POST /api/shows/{id}/select`
 - `POST /api/shows/{id}/reorder`
-- `POST /api/shows/{id}/detect-intros` (detects intros + outros)
+- `POST /api/shows/{id}/detect-intros` (detects intros + outros; returns `ffmpeg_downloading`/`ffmpeg_progress` to coordinate with an in-flight managed `ffmpeg` download; returns `intro_template` and accepts `intro_template` + windowed `offset_sec` fingerprints for two-phase extrapolation)
 - `POST /api/shows/{id}/watched`
 - `PATCH/POST /api/episodes/{id}/progress`
 - `PATCH/POST /api/episodes/{id}/intro`
@@ -173,7 +188,7 @@ cp ./target/release/notflix ./notflix
 
 ### Important Invariants for Future Agents
 1. **Static Embedding**: Always rebuild `--release` (and update `./notflix` if tracking the precompiled Linux binary) after editing any file in `static/`.
-2. **Schema Backwards Compatibility**: Never drop/recreate SQLite tables destructively; always add new columns via `MIGRATIONS` (`ALTER TABLE`) in `src/storage.rs` with sensible defaults.
+2. **Schema Backwards Compatibility**: Never drop/recreate SQLite tables destructively; always add new columns via `MIGRATIONS` (`ALTER TABLE`) in `src/storage/schema.rs` with sensible defaults.
 3. **Subprocess Timeout Safety**: `run_command_with_timeout` in `src/util.rs` intentionally returns without joining pipe reader threads on timeout so grandchild processes cannot hang cleanup.
 4. **CI & Auto-Releases**: `.github/workflows/ci.yml` runs fmt, Clippy, tests, and release builds on Linux/macOS/Windows. `.github/workflows/release.yml` automatically creates a new GitHub Release with prebuilt binaries for all 4 targets on every push to `main` and on `v*` tags.
 5. **Keep This File Current**: Whenever you add, change, or remove a feature, route, CLI flag, or env var, update `AGENTS.md` alongside your code changes.

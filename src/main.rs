@@ -3,10 +3,15 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::Parser;
 use tokio::net::TcpListener;
 
+use notflix::ffmpeg_bin::{
+    auto_ffmpeg_enabled, default_ffmpeg_dir, resolve_ffmpeg_in, resolve_ffprobe_in, FfmpegManager,
+    DEFAULT_DOWNLOAD_TIMEOUT_SEC,
+};
 use notflix::server::{build_router, AppState};
 use notflix::storage::{default_db_path, NotflixStore};
 use notflix::updater::{
@@ -57,6 +62,10 @@ struct Cli {
     /// Do not automatically open Notflix in your default web browser on startup
     #[arg(long)]
     no_open: bool,
+
+    /// Skip automatic download of ffmpeg/ffprobe binaries on startup
+    #[arg(long)]
+    no_ffmpeg_download: bool,
 }
 
 fn auto_update_enabled(cli_disabled: bool) -> bool {
@@ -66,11 +75,7 @@ fn auto_update_enabled(cli_disabled: bool) -> bool {
     if std::env::var("NOTFLIX_SKIP_AUTO_UPDATE").ok().as_deref() == Some("1") {
         return false;
     }
-    let env_flag = std::env::var("NOTFLIX_AUTO_UPDATE")
-        .unwrap_or_else(|_| "1".to_string())
-        .trim()
-        .to_ascii_lowercase();
-    !matches!(env_flag.as_str(), "0" | "false" | "no" | "off")
+    notflix::util::env_flag_enabled("NOTFLIX_AUTO_UPDATE")
 }
 
 fn init_tracing(quiet: bool) {
@@ -99,7 +104,7 @@ fn maybe_run_startup_update(
         if let Some(backup) = &res.backup_path {
             println!("[updater] Database backup saved to: {backup}");
         }
-        if res.branch.as_deref() != Some("release") {
+        if res.remote.as_deref() != Some("github-releases") {
             println!("[updater] Source updated. Rebuild or restart Notflix to load updated code.");
         }
     } else if matches!(
@@ -109,6 +114,53 @@ fn maybe_run_startup_update(
         println!("[updater] {}", res.message);
     }
     Some(res)
+}
+
+fn maybe_relaunch_after_update(startup_update: Option<&UpdateResult>) -> Option<ExitCode> {
+    let res = startup_update?;
+    let already_relaunched = std::env::var("NOTFLIX_RELAUNCHED").ok().as_deref() == Some("1");
+    let exe_path = std::env::current_exe().unwrap_or_default();
+    if !should_relaunch_after_startup_update(res, &exe_path, already_relaunched) {
+        return None;
+    }
+    println!("[updater] Launching updated Notflix binary...");
+    match relaunch_updated_binary() {
+        Ok(code) => Some(code),
+        Err(err) => {
+            eprintln!(
+                "[updater] Could not auto-relaunch updated binary ({err}); continuing with current process."
+            );
+            None
+        }
+    }
+}
+
+fn maybe_open_browser(no_open: bool, host: &str, actual_addr: SocketAddr, url: &str) {
+    if no_open || std::env::var("NOTFLIX_NO_OPEN").ok().as_deref() == Some("1") {
+        return;
+    }
+    let browser_url = if host == "0.0.0.0" || host == "::" {
+        format!("http://127.0.0.1:{}", actual_addr.port())
+    } else {
+        url.to_string()
+    };
+    notflix::open_browser(&browser_url);
+}
+
+fn init_ffmpeg_manager(no_ffmpeg_download: bool) -> Arc<FfmpegManager> {
+    if !auto_ffmpeg_enabled(no_ffmpeg_download) {
+        return Arc::new(FfmpegManager::new_disabled());
+    }
+    let manager = Arc::new(FfmpegManager::new());
+    let dir = default_ffmpeg_dir();
+    if resolve_ffmpeg_in(&dir).is_none() || resolve_ffprobe_in(&dir).is_none() {
+        manager.mark_downloading("Downloading ffmpeg/ffprobe...");
+        let bg_ffmpeg = Arc::clone(&manager);
+        tokio::task::spawn_blocking(move || {
+            let _ = bg_ffmpeg.ensure_binaries(None, None, DEFAULT_DOWNLOAD_TIMEOUT_SEC);
+        });
+    }
+    manager
 }
 
 #[tokio::main]
@@ -128,20 +180,8 @@ async fn main() -> ExitCode {
     let startup_update =
         maybe_run_startup_update(cli.no_auto_update, cli.update_timeout, &resolved_db);
 
-    if let Some(ref res) = startup_update {
-        let already_relaunched = std::env::var("NOTFLIX_RELAUNCHED").ok().as_deref() == Some("1");
-        let exe_path = std::env::current_exe().unwrap_or_default();
-        if should_relaunch_after_startup_update(res, &exe_path, already_relaunched) {
-            println!("[updater] Launching updated Notflix binary...");
-            match relaunch_updated_binary() {
-                Ok(code) => return code,
-                Err(err) => {
-                    eprintln!(
-                        "[updater] Could not auto-relaunch updated binary ({err}); continuing with current process."
-                    );
-                }
-            }
-        }
+    if let Some(code) = maybe_relaunch_after_update(startup_update.as_ref()) {
+        return code;
     }
 
     let store = match NotflixStore::new(Some(resolved_db)) {
@@ -169,16 +209,11 @@ async fn main() -> ExitCode {
     println!("Database: {}", store.db_path().display());
     println!("Press Ctrl+C to stop.");
 
-    if !cli.no_open && std::env::var("NOTFLIX_NO_OPEN").ok().as_deref() != Some("1") {
-        let browser_url = if cli.host == "0.0.0.0" || cli.host == "::" {
-            format!("http://127.0.0.1:{}", actual_addr.port())
-        } else {
-            url
-        };
-        notflix::open_browser(&browser_url);
-    }
+    maybe_open_browser(cli.no_open, &cli.host, actual_addr, &url);
 
-    let state = AppState::new(store, cli.static_dir, None, startup_update, cli.quiet);
+    let ffmpeg_manager = init_ffmpeg_manager(cli.no_ffmpeg_download);
+    let state = AppState::new(store, cli.static_dir, None, startup_update, cli.quiet)
+        .with_ffmpeg_manager(ffmpeg_manager);
     let app = build_router(state);
 
     if let Err(err) = axum::serve(listener, app)

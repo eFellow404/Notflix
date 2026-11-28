@@ -1,70 +1,23 @@
 //! Integration tests for cross-episode intro detection, container chapter parsing, and media helpers.
 
+mod common;
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
 use axum::http::{header, StatusCode};
+use common::{make_episode_vectors, perturb_vec, rand_vec, Rng};
 use http_body_util::BodyExt;
 use notflix::chapters as chapters_mod;
 use notflix::intro_detector::{
     self as detector_mod, build_fingerprint, detect_intro_from_chapters,
     detect_outro_from_chapters, detect_show_intros_server, detect_show_outros_server,
-    extract_audio_fingerprint_from_pcm, extract_mkv_chapters, extract_mp4_chapters,
-    find_shared_intros_default, find_shared_outros, is_outro_chapter_title, ChapterMarker,
+    discover_intro_template_default, extract_audio_fingerprint_from_pcm, extract_mkv_chapters,
+    extract_mp4_chapters, find_shared_intros_default, find_shared_outros, is_outro_chapter_title,
+    match_episodes_against_template, ChapterMarker,
 };
 use notflix::media::{guess_video_mime, parse_range_header, stream_video_file};
-
-/// Tiny deterministic SplitMix64 PRNG so tests need no external `rand` crate.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn uniform(&mut self, low: f64, high: f64) -> f64 {
-        let unit = ((self.next_u64() >> 11) as f64) * (1.0 / ((1u64 << 53) as f64));
-        low + unit * (high - low)
-    }
-}
-
-fn rand_vec(rng: &mut Rng, dim: usize) -> Vec<f64> {
-    (0..dim).map(|_| rng.uniform(20.0, 235.0)).collect()
-}
-
-fn perturb_vec(rng: &mut Rng, vec: &[f64], noise: f64) -> Vec<f64> {
-    vec.iter()
-        .map(|&v| (v + rng.uniform(-noise, noise)).clamp(0.0, 255.0))
-        .collect()
-}
-
-fn make_episode_vectors(
-    rng: &mut Rng,
-    total_frames: usize,
-    intro_template: Option<&[Vec<f64>]>,
-    intro_offset: usize,
-    noise: f64,
-) -> Vec<Vec<f64>> {
-    let mut frames: Vec<Vec<f64>> = (0..total_frames).map(|_| rand_vec(rng, 36)).collect();
-    if let Some(template) = intro_template {
-        for (idx, base) in template.iter().enumerate() {
-            let pos = intro_offset + idx;
-            if pos < total_frames {
-                frames[pos] = perturb_vec(rng, base, noise);
-            }
-        }
-    }
-    frames
-}
 
 fn ebml_vint_size(n: usize) -> Vec<u8> {
     if n < 0x7f {
@@ -84,7 +37,7 @@ fn ebml_elem(eid_bytes: &[u8], payload: &[u8]) -> Vec<u8> {
     out
 }
 
-fn build_minimal_mkv_with_chapters(chapters: &[(f64, f64, &str)]) -> Vec<u8> {
+fn build_mkv_chapters_el(chapters: &[(f64, f64, &str)]) -> Vec<u8> {
     let mut atoms = Vec::new();
     for &(start_s, end_s, title) in chapters {
         let start_ns = (start_s * 1_000_000_000.0) as u64;
@@ -97,7 +50,11 @@ fn build_minimal_mkv_with_chapters(chapters: &[(f64, f64, &str)]) -> Vec<u8> {
         atoms.extend_from_slice(&ebml_elem(&[0xb6], &body));
     }
     let edition = ebml_elem(&[0x45, 0xb9], &atoms);
-    let chapters_el = ebml_elem(&[0x10, 0x43, 0xa7, 0x70], &edition);
+    ebml_elem(&[0x10, 0x43, 0xa7, 0x70], &edition)
+}
+
+fn build_minimal_mkv_with_chapters(chapters: &[(f64, f64, &str)]) -> Vec<u8> {
+    let chapters_el = build_mkv_chapters_el(chapters);
     let ebml_header = ebml_elem(
         &[0x1a, 0x45, 0xdf, 0xa3],
         &ebml_elem(&[0x42, 0x82], b"matroska"),
@@ -109,19 +66,7 @@ fn build_minimal_mkv_with_chapters(chapters: &[(f64, f64, &str)]) -> Vec<u8> {
 }
 
 fn build_mkv_with_seekhead_past_cluster(chapters: &[(f64, f64, &str)]) -> Vec<u8> {
-    let mut atoms = Vec::new();
-    for &(start_s, end_s, title) in chapters {
-        let start_ns = (start_s * 1_000_000_000.0) as u64;
-        let end_ns = (end_s * 1_000_000_000.0) as u64;
-        let disp = ebml_elem(&[0x80], &ebml_elem(&[0x85], title.as_bytes()));
-        let mut body = Vec::new();
-        body.extend_from_slice(&ebml_elem(&[0x91], &start_ns.to_be_bytes()));
-        body.extend_from_slice(&ebml_elem(&[0x92], &end_ns.to_be_bytes()));
-        body.extend_from_slice(&disp);
-        atoms.extend_from_slice(&ebml_elem(&[0xb6], &body));
-    }
-    let edition = ebml_elem(&[0x45, 0xb9], &atoms);
-    let chapters_el = ebml_elem(&[0x10, 0x43, 0xa7, 0x70], &edition);
+    let chapters_el = build_mkv_chapters_el(chapters);
     let cluster_el = ebml_elem(&[0x1f, 0x43, 0xb6, 0x75], &[0u8; 64]);
 
     // Build SeekHead twice so we know its exact encoded size before computing Chapters offset
@@ -193,7 +138,7 @@ fn detects_shared_intro_with_variable_cold_opens() {
     let fps: Vec<_> = offsets
         .iter()
         .map(|&(ep_id, off)| {
-            let raw = make_episode_vectors(&mut rng, 160, Some(&intro_template), off, 8.0);
+            let raw = make_episode_vectors(&mut rng, 160, 36, Some(&intro_template), off, 8.0);
             build_fingerprint(ep_id, step, &raw, None, 0.0, "visual", 8.0)
         })
         .collect();
@@ -228,10 +173,10 @@ fn pilot_without_intro_not_falsely_tagged() {
     let step = 1.5;
     let intro_template: Vec<Vec<f64>> = (0..28).map(|_| rand_vec(&mut rng, 36)).collect(); // 42s intro
 
-    let pilot_raw = make_episode_vectors(&mut rng, 140, None, 0, 8.0);
-    let ep2_raw = make_episode_vectors(&mut rng, 140, Some(&intro_template), 12, 8.0);
-    let ep3_raw = make_episode_vectors(&mut rng, 140, Some(&intro_template), 34, 8.0);
-    let ep4_raw = make_episode_vectors(&mut rng, 140, Some(&intro_template), 4, 8.0);
+    let pilot_raw = make_episode_vectors(&mut rng, 140, 36, None, 0, 8.0);
+    let ep2_raw = make_episode_vectors(&mut rng, 140, 36, Some(&intro_template), 12, 8.0);
+    let ep3_raw = make_episode_vectors(&mut rng, 140, 36, Some(&intro_template), 34, 8.0);
+    let ep4_raw = make_episode_vectors(&mut rng, 140, 36, Some(&intro_template), 4, 8.0);
 
     let fps = vec![
         build_fingerprint("pilot", step, &pilot_raw, None, 0.0, "visual", 0.0),
@@ -639,14 +584,14 @@ fn consensus_trims_pre_intro_shared_by_subset_of_episodes() {
     let true_intro: Vec<Vec<f64>> = (0..35).map(|_| rand_vec(&mut rng, 72)).collect();
 
     // Ep1 & Ep2 share a 15s recap directly before the 35s intro; Ep3 & Ep4 only have the 35s intro
-    let mut ep1_raw = make_episode_vectors(&mut rng, 150, Some(&true_intro), 30, 6.0);
-    let mut ep2_raw = make_episode_vectors(&mut rng, 150, Some(&true_intro), 50, 6.0);
+    let mut ep1_raw = make_episode_vectors(&mut rng, 150, 72, Some(&true_intro), 30, 6.0);
+    let mut ep2_raw = make_episode_vectors(&mut rng, 150, 72, Some(&true_intro), 50, 6.0);
     for (idx, v) in recap_prefix.iter().enumerate() {
         ep1_raw[15 + idx] = perturb_vec(&mut rng, v, 6.0);
         ep2_raw[35 + idx] = perturb_vec(&mut rng, v, 6.0);
     }
-    let ep3_raw = make_episode_vectors(&mut rng, 150, Some(&true_intro), 20, 6.0);
-    let ep4_raw = make_episode_vectors(&mut rng, 150, Some(&true_intro), 60, 6.0);
+    let ep3_raw = make_episode_vectors(&mut rng, 150, 72, Some(&true_intro), 20, 6.0);
+    let ep4_raw = make_episode_vectors(&mut rng, 150, 72, Some(&true_intro), 60, 6.0);
 
     let fps = vec![
         build_fingerprint("ep1", step, &ep1_raw, None, 0.0, "visual", 8.0),
@@ -674,8 +619,8 @@ fn stray_pre_intro_frames_and_fade_do_not_shift_start_early() {
     let stray: Vec<Vec<f64>> = (0..2).map(|_| rand_vec(&mut rng, 72)).collect();
     let black = vec![2.0; 72];
 
-    let mut ep1_raw = make_episode_vectors(&mut rng, 140, Some(&true_intro), 40, 5.0);
-    let mut ep2_raw = make_episode_vectors(&mut rng, 140, Some(&true_intro), 60, 5.0);
+    let mut ep1_raw = make_episode_vectors(&mut rng, 140, 72, Some(&true_intro), 40, 5.0);
+    let mut ep2_raw = make_episode_vectors(&mut rng, 140, 72, Some(&true_intro), 60, 5.0);
 
     // Put 2 stray matching frames + 4 black fade frames directly before the true intro
     ep1_raw[34..36].clone_from_slice(&stray);
@@ -720,7 +665,8 @@ fn opening_logo_and_intro_never_bridge_real_content_gap() {
 
     let mut fps = Vec::new();
     for (id, intro_start) in [("ep1", 30), ("ep2", 30), ("ep3", 30), ("ep4", 42)] {
-        let mut frames = make_episode_vectors(&mut rng, 140, Some(&true_intro), intro_start, 5.0);
+        let mut frames =
+            make_episode_vectors(&mut rng, 140, 72, Some(&true_intro), intro_start, 5.0);
         for (k, v) in opening_bumper.iter().enumerate() {
             frames[k] = perturb_vec(&mut rng, v, 5.0);
         }
@@ -934,7 +880,7 @@ fn find_shared_outros_converts_tail_offsets_and_guards_first_half() {
     let fps: Vec<_> = cases
         .iter()
         .map(|&(id, dur, tail_off)| {
-            let raw = make_episode_vectors(&mut rng, 180, Some(&outro_template), tail_off, 6.0);
+            let raw = make_episode_vectors(&mut rng, 180, 48, Some(&outro_template), tail_off, 6.0);
             build_fingerprint(id, step, &raw, None, dur, "audio", 8.0)
         })
         .collect();
@@ -965,7 +911,7 @@ fn find_shared_outros_converts_tail_offsets_and_guards_first_half() {
     let short_fps: Vec<_> = ["short1", "short2"]
         .iter()
         .map(|&id| {
-            let raw = make_episode_vectors(&mut rng, 180, Some(&outro_template), 10, 5.0);
+            let raw = make_episode_vectors(&mut rng, 180, 48, Some(&outro_template), 10, 5.0);
             build_fingerprint(id, step, &raw, None, 200.0, "audio", 8.0)
         })
         .collect();
@@ -974,4 +920,279 @@ fn find_shared_outros_converts_tail_offsets_and_guards_first_half() {
         short_detected.is_empty(),
         "expected first-half match to be rejected, got {short_detected:?}"
     );
+}
+
+#[test]
+fn correlated_color_cast_background_does_not_bleed_before_or_after_intro() {
+    let mut rng = Rng::new(202601);
+    let step = 1.0;
+    let dim = 84usize;
+    let total_frames = 340usize;
+    let intro_len = 40usize;
+
+    // Shared warm-indoor color-cast baseline added to ALL non-intro frames across every episode
+    // so unrelated pre-intro and post-intro scenes have ~0.64 raw cosine similarity.
+    let warm_bias: Vec<f64> = (0..dim).map(|_| rng.uniform(-70.0, 70.0)).collect();
+    let intro_template: Vec<Vec<f64>> = (0..intro_len).map(|_| rand_vec(&mut rng, dim)).collect();
+
+    let offsets = [("ep1", 20usize), ("ep2", 95), ("ep3", 185), ("ep4", 260)];
+    let fps: Vec<_> = offsets
+        .iter()
+        .map(|&(ep_id, off)| {
+            let mut frames: Vec<Vec<f64>> = (0..total_frames)
+                .map(|_| {
+                    warm_bias
+                        .iter()
+                        .map(|&b| {
+                            (127.5 + 0.80 * b + 0.60 * rng.uniform(-70.0, 70.0)).clamp(0.0, 255.0)
+                        })
+                        .collect()
+                })
+                .collect();
+            for (idx, base) in intro_template.iter().enumerate() {
+                frames[off + idx] = perturb_vec(&mut rng, base, 5.0);
+            }
+            build_fingerprint(ep_id, step, &frames, None, 1320.0, "visual", 8.0)
+        })
+        .collect();
+
+    // Verify our synthetic background genuinely exhibits strong (~0.55-0.75) raw cosine similarity
+    let mean_bg_sim: f64 = fps[0].vectors[..20]
+        .iter()
+        .zip(&fps[1].vectors[..20])
+        .map(|(a, b)| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>())
+        .sum::<f64>()
+        / 20.0;
+    assert!(
+        (0.50..=0.80).contains(&mean_bg_sim),
+        "expected strong background correlation (~0.55-0.75), got {mean_bg_sim:.3}"
+    );
+
+    let detected = find_shared_intros_default(&fps);
+    assert_eq!(detected.len(), 4);
+    for &(ep_id, off) in &offsets {
+        let span = &detected[ep_id];
+        let expected_start = (off as f64) * step;
+        let expected_end = ((off + intro_len) as f64) * step;
+        assert!(
+            (span.start_sec - expected_start).abs() <= 2.0,
+            "{ep_id}: pre-intro bleed under correlated background! got start {:.2}s (expected ~{expected_start}s)",
+            span.start_sec
+        );
+        assert!(
+            (span.end_sec - expected_end).abs() <= 2.0,
+            "{ep_id}: post-intro bleed under correlated background! got end {:.2}s (expected ~{expected_end}s)",
+            span.end_sec
+        );
+    }
+}
+
+#[test]
+fn post_intro_fade_and_coincidental_frames_do_not_bleed_end_late() {
+    let mut rng = Rng::new(202602);
+    let step = 1.0;
+    let dim = 84usize;
+    let total_frames = 180usize;
+    let intro_len = 35usize;
+
+    let true_intro: Vec<Vec<f64>> = (0..intro_len).map(|_| rand_vec(&mut rng, dim)).collect();
+    let pre_coincidental: Vec<Vec<f64>> = (0..2).map(|_| rand_vec(&mut rng, dim)).collect();
+    let post_coincidental: Vec<Vec<f64>> = (0..2).map(|_| rand_vec(&mut rng, dim)).collect();
+    let black = vec![2.0; dim];
+
+    let offsets = [("ep1", 25usize), ("ep2", 55), ("ep3", 85), ("ep4", 115)];
+    let fps: Vec<_> = offsets
+        .iter()
+        .map(|&(ep_id, off)| {
+            // Exact 35s intro surrounded by random background frames
+            let mut frames =
+                make_episode_vectors(&mut rng, total_frames, dim, Some(&true_intro), off, 5.0);
+            // 2 coincidental matching frames + 3 black/flat fade frames directly before the intro
+            for (k, v) in pre_coincidental.iter().enumerate() {
+                frames[off - 5 + k] = perturb_vec(&mut rng, v, 4.0);
+            }
+            for frame in frames.iter_mut().take(off).skip(off - 3) {
+                *frame = black.clone();
+            }
+            // 3 black/flat fade frames + 2 coincidental matching frames directly after the intro
+            for frame in frames
+                .iter_mut()
+                .take(off + intro_len + 3)
+                .skip(off + intro_len)
+            {
+                *frame = black.clone();
+            }
+            for (k, v) in post_coincidental.iter().enumerate() {
+                frames[off + intro_len + 3 + k] = perturb_vec(&mut rng, v, 4.0);
+            }
+            build_fingerprint(ep_id, step, &frames, None, 1320.0, "visual", 8.0)
+        })
+        .collect();
+
+    let detected = find_shared_intros_default(&fps);
+    assert_eq!(detected.len(), 4);
+    for &(ep_id, off) in &offsets {
+        let span = &detected[ep_id];
+        let expected_start = (off as f64) * step;
+        let expected_end = ((off + intro_len) as f64) * step;
+        assert!(
+            (span.start_sec - expected_start).abs() <= 2.0,
+            "{ep_id}: intro start bled early! got {:.2}s (expected ~{expected_start}s)",
+            span.start_sec
+        );
+        assert!(
+            (span.end_sec - expected_end).abs() <= 2.0,
+            "{ep_id}: intro end bled late! got {:.2}s (expected ~{expected_end}s)",
+            span.end_sec
+        );
+    }
+}
+
+#[test]
+fn discover_template_on_reference_episodes_and_extrapolate_to_many_windowed_episodes() {
+    let mut rng = Rng::new(202603);
+    let step = 1.0;
+    let dim = 84usize;
+    let intro_len = 42usize;
+    let true_intro: Vec<Vec<f64>> = (0..intro_len).map(|_| rand_vec(&mut rng, dim)).collect();
+
+    let make_frames = |rng: &mut Rng, len: usize, intro_at: Option<usize>| -> Vec<Vec<f64>> {
+        make_episode_vectors(
+            rng,
+            len,
+            dim,
+            intro_at.map(|_| true_intro.as_slice()),
+            intro_at.unwrap_or(0),
+            5.0,
+        )
+    };
+
+    // 4 reference episodes (full 360s scans) with a 42s intro at varying timestamps
+    let ref_offsets = [
+        ("ref1", 10usize),
+        ("ref2", 75),
+        ("ref3", 160),
+        ("ref4", 240),
+    ];
+    let ref_fps: Vec<_> = ref_offsets
+        .iter()
+        .map(|&(id, off)| {
+            let raw = make_frames(&mut rng, 360, Some(off));
+            build_fingerprint(id, step, &raw, None, 1320.0, "visual", 8.0)
+        })
+        .collect();
+
+    let template =
+        discover_intro_template_default(&ref_fps).expect("should discover intro template");
+    let template_dur = (template.vectors.len() as f64) * template.step_sec;
+    assert!(
+        (template_dur - (intro_len as f64)).abs() <= 2.5,
+        "expected template duration ~{intro_len}s, got {template_dur:.2}s"
+    );
+    assert_eq!(template.flat_flags.len(), template.vectors.len());
+    assert_eq!(template.weights.len(), template.vectors.len());
+
+    // 10 MORE episodes: 4 full scans, 4 windowed scans using `.with_offset(...)`,
+    // 1 late-intro episode at 310s, and 1 pilot with NO intro.
+    let mut target_fps = Vec::new();
+    let mut expected_intros: Vec<(&str, f64)> = Vec::new();
+
+    for &(id, off) in &[("ep5", 0usize), ("ep6", 50), ("ep7", 135), ("ep8", 220)] {
+        let raw = make_frames(&mut rng, 360, Some(off));
+        target_fps.push(build_fingerprint(
+            id, step, &raw, None, 1320.0, "visual", 8.0,
+        ));
+        expected_intros.push((id, (off as f64) * step));
+    }
+
+    for &(id, true_start) in &[
+        ("ep9", 30usize),
+        ("ep10", 115),
+        ("ep11", 190),
+        ("ep12", 275),
+    ] {
+        let window_start = true_start - 10;
+        let window_len = intro_len + 20;
+        let raw = make_frames(&mut rng, window_len, Some(10));
+        let fp = build_fingerprint(id, step, &raw, None, 1320.0, "visual", 8.0)
+            .with_offset((window_start as f64) * step);
+        target_fps.push(fp);
+        expected_intros.push((id, (true_start as f64) * step));
+    }
+
+    // Episode whose intro is at 310s (past 300s)
+    let late_raw = make_frames(&mut rng, 400, Some(310));
+    target_fps.push(build_fingerprint(
+        "ep13", step, &late_raw, None, 1320.0, "visual", 8.0,
+    ));
+    expected_intros.push(("ep13", 310.0));
+
+    // Pilot with NO intro
+    let pilot_raw = make_frames(&mut rng, 360, None);
+    target_fps.push(build_fingerprint(
+        "pilot", step, &pilot_raw, None, 1320.0, "visual", 8.0,
+    ));
+
+    let matched = match_episodes_against_template(&target_fps, &template);
+    assert!(
+        !matched.contains_key("pilot"),
+        "pilot without intro should not be matched, got {:?}",
+        matched.get("pilot")
+    );
+    assert_eq!(matched.len(), 9);
+
+    for (id, expected_start) in expected_intros {
+        let span = matched
+            .get(id)
+            .unwrap_or_else(|| panic!("expected template match for {id}"));
+        let expected_end = expected_start + (intro_len as f64) * step;
+        assert!(
+            (span.start_sec - expected_start).abs() <= 2.0,
+            "{id}: expected start ~{expected_start}s, got {:.2}s",
+            span.start_sec
+        );
+        assert!(
+            (span.end_sec - expected_end).abs() <= 2.0,
+            "{id}: expected end ~{expected_end}s, got {:.2}s",
+            span.end_sec
+        );
+    }
+}
+
+#[test]
+fn subsecond_phase_shift_aligns_cleanly_without_boundary_bleed() {
+    let sample_rate = 4000usize;
+    let total_sec = 160usize;
+    let theme_sec = 36usize;
+    let mut rng = Rng::new(202604);
+
+    let theme = synth_theme_song_pcm(theme_sec, sample_rate);
+    let cases = [("ep1", 25.0_f64), ("ep2", 55.45), ("ep3", 88.5)];
+
+    let fps: Vec<_> = cases
+        .iter()
+        .map(|&(id, start_sec)| {
+            let mut pcm = synth_speech_like_pcm(&mut rng, total_sec, sample_rate);
+            let start_sample = (start_sec * (sample_rate as f64)).round() as usize;
+            pcm[start_sample..start_sample + theme.len()].copy_from_slice(&theme);
+            extract_audio_fingerprint_from_pcm(&pcm, id, 1.0).expect(id)
+        })
+        .collect();
+
+    let detected = find_shared_intros_default(&fps);
+    assert_eq!(detected.len(), 3);
+    for &(id, expected_start) in &cases {
+        let span = &detected[id];
+        let expected_end = expected_start + (theme_sec as f64);
+        assert!(
+            (span.start_sec - expected_start).abs() <= 2.5,
+            "{id}: subsecond phase shift start off target: got {:.2}s (expected ~{expected_start:.2}s)",
+            span.start_sec
+        );
+        assert!(
+            (span.end_sec - expected_end).abs() <= 2.5,
+            "{id}: subsecond phase shift end off target: got {:.2}s (expected ~{expected_end:.2}s)",
+            span.end_sec
+        );
+    }
 }

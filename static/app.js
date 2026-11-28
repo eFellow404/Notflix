@@ -1,4 +1,4 @@
-import { api, byId } from "./js/utils.js";
+import { api, byId, storageGet } from "./js/utils.js";
 import { state } from "./js/state.js";
 import { initIntro } from "./js/intro.js";
 import { initSidebar, renderSeasonSidebar } from "./js/sidebar.js";
@@ -58,17 +58,13 @@ function wireModules() {
 }
 
 function restorePreferences() {
-  try {
-    const savedVol = localStorage.getItem("notflix_volume");
-    if (savedVol !== null && Number.isFinite(Number(savedVol))) {
-      byId("videoPlayer").volume = Math.max(0, Math.min(1, Number(savedVol)));
-    }
-    const savedAuto = localStorage.getItem("notflix_autoplay");
-    if (savedAuto !== null) {
-      state.autoplayNext = savedAuto !== "0";
-    }
-  } catch {
-    // Ignore storage errors (e.g. restricted browsing modes)
+  const savedVol = storageGet("notflix_volume");
+  if (savedVol !== null && Number.isFinite(Number(savedVol))) {
+    byId("videoPlayer").volume = Math.max(0, Math.min(1, Number(savedVol)));
+  }
+  const savedAuto = storageGet("notflix_autoplay");
+  if (savedAuto !== null) {
+    state.autoplayNext = savedAuto !== "0";
   }
 }
 

@@ -1,4 +1,14 @@
-import { api, byId, escapeHtml, formatTime, hasValidIntro, showToast } from "./utils.js";
+import {
+  api,
+  byId,
+  el,
+  encodePath,
+  formatTime,
+  hasValidIntro,
+  pluralize,
+  showToast,
+  withButtonBusy,
+} from "./utils.js";
 import { compactEpisodeBadge, findGroupKeyForEpisode } from "./seasons.js";
 import { getEpisodeById, setLinkedList, state, updateEpisodeInState } from "./state.js";
 
@@ -8,7 +18,15 @@ let callbacks = {
   onLinksChanged: () => {},
 };
 
+let searchDebounceTimer = null;
+let lastSelectorSig = "";
+
 export function resetSidebarFilters() {
+  if (searchDebounceTimer) {
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = null;
+  }
+  lastSelectorSig = "";
   state.episodeQuery = "";
   state.unwatchedOnly = false;
   state.reorderMode = false;
@@ -19,48 +37,95 @@ export function resetSidebarFilters() {
   byId("toggleReorderBtn").classList.remove("active-toggle");
 }
 
+function syncLinkedListState(
+  linkedList,
+  { currentId = state.currentEpisode?.id, notifyLinks = false } = {}
+) {
+  setLinkedList(linkedList);
+  const current = getEpisodeById(currentId);
+  if (current) {
+    state.currentEpisode = current;
+    if (notifyLinks) callbacks.onLinksChanged();
+  }
+}
+
+function buildSelectorSignature(groups, currentGroupKey) {
+  const showId = state.activeShow?.id || "";
+  const groupSummary = groups
+    .map((g) => {
+      const watched = g.episodes.filter((e) => e.watched).length;
+      return `${g.key}:${g.label}:${g.episodes.length}:${watched}`;
+    })
+    .join("|");
+  return `${showId}#${state.activeGroupKey}#${currentGroupKey}#${groupSummary}`;
+}
+
 function renderSeasonSelector(groups, currentGroupKey) {
   const wrap = byId("seasonSelectorWrap");
   const tabsEl = byId("seasonTabs");
   const selectRow = byId("seasonSelectRow");
 
   if (groups.length <= 1) {
+    lastSelectorSig = "";
     wrap.classList.add("hidden");
     return;
   }
+
+  const sig = buildSelectorSignature(groups, currentGroupKey);
+  if (sig === lastSelectorSig) {
+    wrap.classList.remove("hidden");
+    return;
+  }
+  lastSelectorSig = sig;
 
   wrap.classList.remove("hidden");
   if (groups.length <= 5) {
     tabsEl.classList.remove("hidden");
     selectRow.classList.add("hidden");
-    tabsEl.innerHTML = groups
-      .map((g) => {
-        const isActive = g.key === state.activeGroupKey;
-        const hasPlaying = g.key === currentGroupKey;
-        return `
-          <button
-            class="season-tab ${isActive ? "active" : ""} ${hasPlaying ? "has-playing" : ""}"
-            role="tab"
-            aria-selected="${isActive ? "true" : "false"}"
-            data-season-key="${escapeHtml(g.key)}"
-            type="button"
-          >
-            <span>${escapeHtml(g.label)}</span>
-            <span class="season-tab-count">${g.episodes.length}</span>
-          </button>
-        `;
-      })
-      .join("");
+    const frag = document.createDocumentFragment();
+    for (const g of groups) {
+      const isActive = g.key === state.activeGroupKey;
+      const hasPlaying = g.key === currentGroupKey;
+      const classes = ["season-tab"];
+      if (isActive) classes.push("active");
+      if (hasPlaying) classes.push("has-playing");
+
+      frag.appendChild(
+        el(
+          "button",
+          {
+            className: classes.join(" "),
+            role: "tab",
+            "aria-selected": isActive ? "true" : "false",
+            dataset: { seasonKey: g.key },
+            type: "button",
+          },
+          el("span", null, g.label),
+          el("span", { className: "season-tab-count" }, g.episodes.length)
+        )
+      );
+    }
+    tabsEl.replaceChildren(frag);
   } else {
     tabsEl.classList.add("hidden");
     selectRow.classList.remove("hidden");
-    byId("seasonSelect").innerHTML = groups
-      .map((g) => {
-        const watched = g.episodes.filter((e) => e.watched).length;
-        const mark = g.key === currentGroupKey ? "● " : "";
-        return `<option value="${escapeHtml(g.key)}" ${g.key === state.activeGroupKey ? "selected" : ""}>${mark}${escapeHtml(g.label)} (${watched}/${g.episodes.length})</option>`;
-      })
-      .join("");
+    const selectEl = byId("seasonSelect");
+    const frag = document.createDocumentFragment();
+    for (const g of groups) {
+      const watched = g.episodes.filter((e) => e.watched).length;
+      const mark = g.key === currentGroupKey ? "● " : "";
+      frag.appendChild(
+        el(
+          "option",
+          {
+            value: g.key,
+            selected: g.key === state.activeGroupKey,
+          },
+          `${mark}${g.label} (${watched}/${g.episodes.length})`
+        )
+      );
+    }
+    selectEl.replaceChildren(frag);
     const curIdx = groups.findIndex((g) => g.key === state.activeGroupKey);
     byId("prevSeasonBtn").disabled = curIdx <= 0;
     byId("nextSeasonBtn").disabled = curIdx < 0 || curIdx >= groups.length - 1;
@@ -105,6 +170,203 @@ function formatEpisodeMetaTime(ep) {
   return ep.duration_sec > 0 ? formatTime(ep.duration_sec) : "Unwatched";
 }
 
+function createEpisodeThumbnail(ep) {
+  const img = el("img", {
+    className: "ep-thumb",
+    loading: "lazy",
+    alt: "",
+  });
+  img.addEventListener("load", () => img.classList.add("loaded"), { once: true });
+  img.addEventListener("error", () => img.remove(), { once: true });
+  img.src = `/api/episodes/${encodePath(ep.id)}/thumbnail`;
+  if (img.complete && img.naturalWidth > 0) {
+    img.classList.add("loaded");
+  }
+  return img;
+}
+
+function renderEpisodeList(activeGroup, activeId, isSearching, { scrollToActive = false } = {}) {
+  const allEps = state.linkedList?.episodes || [];
+  const query = state.episodeQuery.trim().toLowerCase();
+
+  let visibleEps = isSearching
+    ? allEps.filter((ep) =>
+        `${ep.display_code} ${ep.title} ${ep.filename}`.toLowerCase().includes(query)
+      )
+    : activeGroup
+    ? activeGroup.episodes
+    : allEps;
+
+  if (state.unwatchedOnly) {
+    visibleEps = visibleEps.filter((ep) => !ep.watched);
+  }
+
+  const episodeList = byId("episodeList");
+  if (visibleEps.length === 0) {
+    const emptyText = isSearching
+      ? "No episodes match your search."
+      : state.unwatchedOnly
+      ? "All episodes here are watched!"
+      : "No episodes in this group.";
+    episodeList.replaceChildren(el("div", { className: "ep-empty-msg" }, emptyText));
+    return;
+  }
+
+  const allowReorder =
+    state.reorderMode && !isSearching && !state.unwatchedOnly && visibleEps.length > 1;
+  const showDiscDividers = Boolean(activeGroup?.showDiscDividers && !isSearching);
+  let lastDisc = null;
+
+  const frag = document.createDocumentFragment();
+  for (let localIdx = 0; localIdx < visibleEps.length; localIdx++) {
+    const ep = visibleEps[localIdx];
+    const isActive = ep.id === activeId;
+    const code = compactEpisodeBadge(ep, activeGroup?.kind || "flat", isSearching);
+
+    if (showDiscDividers && ep.disc !== null && ep.disc !== undefined && ep.disc !== lastDisc) {
+      lastDisc = ep.disc;
+      frag.appendChild(el("div", { className: "disc-divider" }, `Disc ${ep.disc}`));
+    }
+
+    const introDot = hasValidIntro(ep)
+      ? el(
+          "span",
+          {
+            className: "ep-intro-dot",
+            title: `Intro ${formatTime(ep.intro_start_sec)}–${formatTime(ep.intro_end_sec)}`,
+          },
+          "Intro"
+        )
+      : null;
+
+    const extraContext =
+      ep.is_extra && ep.season !== null && ep.season !== undefined
+        ? el("span", null, `S${String(ep.season).padStart(2, "0")}`)
+        : null;
+
+    const showProgress = isActive || (ep.progress_percent > 0 && ep.progress_percent < 100);
+
+    const rightControls = allowReorder
+      ? el(
+          "div",
+          { className: "ep-row-actions" },
+          el(
+            "button",
+            {
+              className: "reorder-btn",
+              type: "button",
+              title: "Move earlier",
+              disabled: localIdx === 0,
+              dataset: {
+                moveEp: ep.id,
+                targetIdx: localIdx > 0 ? visibleEps[localIdx - 1].index : ep.index,
+              },
+            },
+            "↑"
+          ),
+          el(
+            "button",
+            {
+              className: "reorder-btn",
+              type: "button",
+              title: "Move later",
+              disabled: localIdx === visibleEps.length - 1,
+              dataset: {
+                moveEp: ep.id,
+                targetIdx:
+                  localIdx < visibleEps.length - 1 ? visibleEps[localIdx + 1].index : ep.index,
+              },
+            },
+            "↓"
+          )
+        )
+      : el(
+          "div",
+          { className: "ep-row-actions" },
+          el(
+            "button",
+            {
+              className: ep.watched ? "watched-toggle-btn is-watched" : "watched-toggle-btn",
+              type: "button",
+              dataset: { toggleWatched: ep.id },
+              title: ep.watched ? "Mark as unwatched" : "Mark as watched",
+              "aria-label": ep.watched ? "Mark as unwatched" : "Mark as watched",
+            },
+            "✓"
+          )
+        );
+
+    const cardClasses = ["ep-row-card"];
+    if (isActive) cardClasses.push("active");
+    if (ep.watched) cardClasses.push("watched");
+
+    const card = el(
+      "div",
+      {
+        className: cardClasses.join(" "),
+        dataset: { selectEp: ep.id },
+      },
+      el(
+        "div",
+        { className: "ep-row-main" },
+        createEpisodeThumbnail(ep),
+        el(
+          "span",
+          { className: ep.is_extra ? "ep-code-pill extra" : "ep-code-pill" },
+          `${isActive ? "▶ " : ""}${code}`
+        ),
+        el(
+          "div",
+          { className: "ep-row-body" },
+          el("div", { className: "ep-row-title", title: ep.filename }, ep.title),
+          el(
+            "div",
+            { className: "ep-row-meta" },
+            el("span", null, formatEpisodeMetaTime(ep)),
+            extraContext,
+            introDot
+          )
+        ),
+        rightControls
+      ),
+      showProgress
+        ? el(
+            "div",
+            { className: "progress-track" },
+            el("div", {
+              className: ep.watched ? "progress-fill complete" : "progress-fill",
+              dataset: { epProgress: ep.id },
+              style: { width: `${ep.progress_percent}%` },
+            })
+          )
+        : null
+    );
+
+    frag.appendChild(card);
+  }
+
+  episodeList.replaceChildren(frag);
+
+  if (scrollToActive) {
+    const activeEl = episodeList.querySelector(".ep-row-card.active");
+    if (activeEl) {
+      activeEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }
+}
+
+function renderFilteredEpisodeList() {
+  if (!state.linkedList || !state.activeShow) return;
+  const groups = state.episodeGroups;
+  const activeId = state.currentEpisode ? state.currentEpisode.id : state.linkedList.current_id;
+  const currentGroupKey = findGroupKeyForEpisode(groups, activeId);
+  const isSearching = state.episodeQuery.trim().length > 0;
+  const activeGroup = groups.find((g) => g.key === state.activeGroupKey) || groups[0] || null;
+
+  renderSeasonProgress(activeGroup, currentGroupKey, isSearching);
+  renderEpisodeList(activeGroup, activeId, isSearching);
+}
+
 export function renderSeasonSidebar({ scrollToActive = false } = {}) {
   if (!state.linkedList || !state.activeShow) return;
   const allEps = state.linkedList.episodes || [];
@@ -117,8 +379,8 @@ export function renderSeasonSidebar({ scrollToActive = false } = {}) {
   const totalWatched = allEps.filter((e) => e.watched).length;
   const seasonCount = groups.filter((g) => g.kind === "season").length;
   const summaryParts = [];
-  if (seasonCount > 1) summaryParts.push(`${seasonCount} seasons`);
-  summaryParts.push(`${allEps.length} episode${allEps.length === 1 ? "" : "s"}`);
+  if (seasonCount > 1) summaryParts.push(pluralize(seasonCount, "season"));
+  summaryParts.push(pluralize(allEps.length, "episode"));
   summaryParts.push(`${totalWatched} watched`);
   byId("sidebarSummary").textContent = summaryParts.join(" · ");
 
@@ -136,121 +398,21 @@ export function renderSeasonSidebar({ scrollToActive = false } = {}) {
 
   const activeId = state.currentEpisode ? state.currentEpisode.id : state.linkedList.current_id;
   const currentGroupKey = findGroupKeyForEpisode(groups, activeId);
-  const query = state.episodeQuery.trim().toLowerCase();
-  const isSearching = query.length > 0;
+  const isSearching = state.episodeQuery.trim().length > 0;
 
   renderSeasonSelector(groups, currentGroupKey);
 
   const activeGroup = groups.find((g) => g.key === state.activeGroupKey) || groups[0] || null;
   renderSeasonProgress(activeGroup, currentGroupKey, isSearching);
-
-  let visibleEps = isSearching
-    ? allEps.filter((ep) =>
-        `${ep.display_code} ${ep.title} ${ep.filename}`.toLowerCase().includes(query)
-      )
-    : activeGroup
-    ? activeGroup.episodes
-    : allEps;
-
-  if (state.unwatchedOnly) {
-    visibleEps = visibleEps.filter((ep) => !ep.watched);
-  }
-
-  const episodeList = byId("episodeList");
-  if (visibleEps.length === 0) {
-    episodeList.innerHTML = `<div class="ep-empty-msg">${
-      isSearching
-        ? "No episodes match your search."
-        : state.unwatchedOnly
-        ? "All episodes here are watched!"
-        : "No episodes in this group."
-    }</div>`;
-    return;
-  }
-
-  const allowReorder = state.reorderMode && !isSearching && !state.unwatchedOnly && visibleEps.length > 1;
-  const showDiscDividers = Boolean(activeGroup?.showDiscDividers && !isSearching);
-  let lastDisc = null;
-
-  episodeList.innerHTML = visibleEps
-    .map((ep, localIdx) => {
-      const isActive = ep.id === activeId;
-      const code = compactEpisodeBadge(ep, activeGroup?.kind || "flat", isSearching);
-      let dividerHtml = "";
-      if (showDiscDividers && ep.disc !== null && ep.disc !== undefined && ep.disc !== lastDisc) {
-        lastDisc = ep.disc;
-        dividerHtml = `<div class="disc-divider">Disc ${ep.disc}</div>`;
-      }
-
-      const introDotHtml = hasValidIntro(ep)
-        ? `<span class="ep-intro-dot" title="Intro ${formatTime(ep.intro_start_sec)}–${formatTime(ep.intro_end_sec)}">Intro</span>`
-        : "";
-      const extraContext =
-        ep.is_extra && ep.season !== null && ep.season !== undefined
-          ? `<span>S${String(ep.season).padStart(2, "0")}</span>`
-          : "";
-      const showProgress = isActive || (ep.progress_percent > 0 && ep.progress_percent < 100);
-
-      const rightControls = allowReorder
-        ? `
-          <div class="ep-row-actions">
-            <button class="reorder-btn" data-move-ep="${ep.id}" data-target-idx="${localIdx > 0 ? visibleEps[localIdx - 1].index : ep.index}" type="button" title="Move earlier" ${localIdx === 0 ? "disabled" : ""}>↑</button>
-            <button class="reorder-btn" data-move-ep="${ep.id}" data-target-idx="${localIdx < visibleEps.length - 1 ? visibleEps[localIdx + 1].index : ep.index}" type="button" title="Move later" ${localIdx === visibleEps.length - 1 ? "disabled" : ""}>↓</button>
-          </div>
-        `
-        : `
-          <div class="ep-row-actions">
-            <button
-              class="watched-toggle-btn ${ep.watched ? "is-watched" : ""}"
-              data-toggle-watched="${ep.id}"
-              type="button"
-              title="${ep.watched ? "Mark as unwatched" : "Mark as watched"}"
-              aria-label="${ep.watched ? "Mark as unwatched" : "Mark as watched"}"
-            >✓</button>
-          </div>
-        `;
-
-      return `
-        ${dividerHtml}
-        <div class="ep-row-card ${isActive ? "active" : ""} ${ep.watched ? "watched" : ""}" data-select-ep="${ep.id}">
-          <div class="ep-row-main">
-            <span class="ep-code-pill ${ep.is_extra ? "extra" : ""}">${isActive ? "▶ " : ""}${escapeHtml(code)}</span>
-            <div class="ep-row-body">
-              <div class="ep-row-title" title="${escapeHtml(ep.filename)}">${escapeHtml(ep.title)}</div>
-              <div class="ep-row-meta">
-                <span>${escapeHtml(formatEpisodeMetaTime(ep))}</span>
-                ${extraContext}
-                ${introDotHtml}
-              </div>
-            </div>
-            ${rightControls}
-          </div>
-          ${
-            showProgress
-              ? `<div class="progress-track"><div class="progress-fill ${ep.watched ? "complete" : ""}" data-ep-progress="${ep.id}" style="width: ${ep.progress_percent}%"></div></div>`
-              : ""
-          }
-        </div>
-      `;
-    })
-    .join("");
-
-  if (scrollToActive) {
-    const activeEl = episodeList.querySelector(".ep-row-card.active");
-    if (activeEl) {
-      activeEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    }
-  }
+  renderEpisodeList(activeGroup, activeId, isSearching, { scrollToActive });
 }
 
 function applyRescanResult(res) {
   state.activeShow = res.show;
-  setLinkedList(res.linked_list);
-  const current = getEpisodeById(state.linkedList.current_id);
-  if (current) {
-    state.currentEpisode = current;
-    callbacks.onLinksChanged();
-  }
+  syncLinkedListState(res.linked_list, {
+    currentId: res.linked_list?.current_id,
+    notifyLinks: true,
+  });
   renderSeasonSidebar();
 }
 
@@ -275,7 +437,7 @@ export function initSidebar(hooks = {}) {
       if (!ep) return;
       const nextWatched = !ep.watched;
       try {
-        const res = await api(`/api/episodes/${epId}/progress`, {
+        const res = await api(`/api/episodes/${encodePath(epId)}/progress`, {
           method: "PATCH",
           body: JSON.stringify({
             watched: nextWatched,
@@ -298,17 +460,12 @@ export function initSidebar(hooks = {}) {
       const epId = moveBtn.dataset.moveEp;
       const targetIdx = Number(moveBtn.dataset.targetIdx);
       try {
-        const res = await api(`/api/shows/${state.activeShow.id}/reorder`, {
+        const res = await api(`/api/shows/${encodePath(state.activeShow.id)}/reorder`, {
           method: "POST",
           body: JSON.stringify({ episode_id: epId, target_index: targetIdx }),
         });
         state.activeShow.manual_order = true;
-        setLinkedList(res.linked_list);
-        const refreshed = getEpisodeById(state.currentEpisode?.id);
-        if (refreshed) {
-          state.currentEpisode = refreshed;
-          callbacks.onLinksChanged();
-        }
+        syncLinkedListState(res.linked_list, { notifyLinks: true });
         renderSeasonSidebar();
       } catch (err) {
         showToast(`Reorder failed: ${err.message}`);
@@ -322,7 +479,7 @@ export function initSidebar(hooks = {}) {
     if (state.currentEpisode && state.currentEpisode.id === epId) return;
     await callbacks.onBeforeEpisodeSwitch();
     try {
-      const res = await api(`/api/shows/${state.activeShow.id}/select`, {
+      const res = await api(`/api/shows/${encodePath(state.activeShow.id)}/select`, {
         method: "POST",
         body: JSON.stringify({ episode_id: epId }),
       });
@@ -369,7 +526,7 @@ export function initSidebar(hooks = {}) {
     const allWatched = activeGroup.episodes.every((e) => e.watched);
     const nextWatched = !allWatched;
     try {
-      const res = await api(`/api/shows/${state.activeShow.id}/watched`, {
+      const res = await api(`/api/shows/${encodePath(state.activeShow.id)}/watched`, {
         method: "POST",
         body: JSON.stringify({
           episode_ids: activeGroup.episodes.map((e) => e.id),
@@ -377,9 +534,7 @@ export function initSidebar(hooks = {}) {
           reset_position: !nextWatched,
         }),
       });
-      setLinkedList(res.linked_list);
-      const refreshed = getEpisodeById(state.currentEpisode?.id);
-      if (refreshed) state.currentEpisode = refreshed;
+      syncLinkedListState(res.linked_list);
       renderSeasonSidebar();
       showToast(
         `${activeGroup.label}: marked ${nextWatched ? "all watched" : "all unwatched"}`,
@@ -393,7 +548,11 @@ export function initSidebar(hooks = {}) {
   const episodeSearchInput = byId("episodeSearchInput");
   episodeSearchInput.addEventListener("input", () => {
     state.episodeQuery = episodeSearchInput.value;
-    renderSeasonSidebar();
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(() => {
+      searchDebounceTimer = null;
+      renderFilteredEpisodeList();
+    }, 80);
   });
 
   const unwatchedFilterBtn = byId("unwatchedFilterBtn");
@@ -401,7 +560,7 @@ export function initSidebar(hooks = {}) {
     state.unwatchedOnly = !state.unwatchedOnly;
     unwatchedFilterBtn.classList.toggle("active", state.unwatchedOnly);
     unwatchedFilterBtn.setAttribute("aria-pressed", String(state.unwatchedOnly));
-    renderSeasonSidebar();
+    renderFilteredEpisodeList();
   });
 
   byId("toggleReorderBtn").addEventListener("click", () => {
@@ -417,34 +576,34 @@ export function initSidebar(hooks = {}) {
   const rescanShowBtn = byId("rescanShowBtn");
   rescanShowBtn.addEventListener("click", async () => {
     if (!state.activeShow) return;
-    rescanShowBtn.disabled = true;
-    rescanShowBtn.textContent = "Scanning…";
-    try {
-      const res = await api(`/api/shows/${state.activeShow.id}/rescan`, {
-        method: "POST",
-        body: JSON.stringify({ reset_order: false }),
-      });
-      applyRescanResult(res);
-      showToast(`Rescanned: +${res.diff.added} added, -${res.diff.removed} removed`, "success");
-    } catch (err) {
-      showToast(`Rescan failed: ${err.message}`);
-    } finally {
-      rescanShowBtn.disabled = false;
-      rescanShowBtn.textContent = "↻ Rescan";
-    }
+    await withButtonBusy(rescanShowBtn, "Scanning…", async () => {
+      try {
+        const res = await api(`/api/shows/${encodePath(state.activeShow.id)}/rescan`, {
+          method: "POST",
+          body: JSON.stringify({ reset_order: false }),
+        });
+        applyRescanResult(res);
+        showToast(`Rescanned: +${res.diff.added} added, -${res.diff.removed} removed`, "success");
+      } catch (err) {
+        showToast(`Rescan failed: ${err.message}`);
+      }
+    });
   });
 
-  byId("resetSmartSortBtn").addEventListener("click", async () => {
+  const resetSmartSortBtn = byId("resetSmartSortBtn");
+  resetSmartSortBtn.addEventListener("click", async () => {
     if (!state.activeShow) return;
-    try {
-      const res = await api(`/api/shows/${state.activeShow.id}/rescan`, {
-        method: "POST",
-        body: JSON.stringify({ reset_order: true }),
-      });
-      applyRescanResult(res);
-      showToast("Restored automatic episode order", "success");
-    } catch (err) {
-      showToast(`Reset failed: ${err.message}`);
-    }
+    await withButtonBusy(resetSmartSortBtn, "Resetting…", async () => {
+      try {
+        const res = await api(`/api/shows/${encodePath(state.activeShow.id)}/rescan`, {
+          method: "POST",
+          body: JSON.stringify({ reset_order: true }),
+        });
+        applyRescanResult(res);
+        showToast("Restored automatic episode order", "success");
+      } catch (err) {
+        showToast(`Reset failed: ${err.message}`);
+      }
+    });
   });
 }

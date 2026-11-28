@@ -2,10 +2,11 @@
 
 mod assets;
 mod episodes;
+mod intros;
 mod shows;
 mod system;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
@@ -20,6 +21,8 @@ use serde_json::{Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::error::{NotflixError, Result};
+use crate::ffmpeg_bin::FfmpegManager;
+use crate::linked_list::EpisodeNode;
 use crate::storage::NotflixStore;
 use crate::updater::{default_repo_dir, UpdateResult};
 use crate::util::canonicalize_clean;
@@ -37,6 +40,7 @@ pub struct AppState {
     pub update_lock: Arc<AsyncMutex<()>>,
     pub last_update_result: Arc<StdMutex<Option<UpdateResult>>>,
     pub quiet: bool,
+    pub(super) ffmpeg_manager: Arc<FfmpegManager>,
 }
 
 impl AppState {
@@ -60,7 +64,13 @@ impl AppState {
             update_lock: Arc::new(AsyncMutex::new(())),
             last_update_result: Arc::new(StdMutex::new(initial_update_result)),
             quiet,
+            ffmpeg_manager: Arc::new(FfmpegManager::new_disabled()),
         }
+    }
+
+    pub fn with_ffmpeg_manager(mut self, manager: Arc<FfmpegManager>) -> Self {
+        self.ffmpeg_manager = manager;
+        self
     }
 
     pub fn current_repo_dir(&self) -> PathBuf {
@@ -123,7 +133,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/shows/{id}/detect-intros",
-            post(shows::handle_detect_intros),
+            post(intros::handle_detect_intros),
         )
         .route("/api/shows/{id}/watched", post(shows::handle_bulk_watched))
         .route(
@@ -192,6 +202,22 @@ pub(super) fn json_no_store(status: StatusCode, payload: Value) -> Response {
     resp
 }
 
+pub(super) fn binary_response(
+    status: StatusCode,
+    content_type: &'static str,
+    cache_control: &'static str,
+    body: Vec<u8>,
+) -> Response {
+    let mut resp = (status, body).into_response();
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    resp
+}
+
 pub(super) fn parse_json_object(body: &Bytes) -> Result<Map<String, Value>> {
     if body.len() > MAX_JSON_BODY_BYTES {
         return Err(NotflixError::BadRequest(
@@ -220,6 +246,62 @@ pub(super) fn value_as_trimmed_string(val: Option<&Value>) -> String {
         Some(Value::Bool(b)) => b.to_string(),
         _ => String::new(),
     }
+}
+
+pub(super) fn required_trimmed_string(map: &Map<String, Value>, key: &str) -> Result<String> {
+    let value = value_as_trimmed_string(map.get(key));
+    if value.is_empty() {
+        return Err(NotflixError::BadRequest(format!("{key} is required")));
+    }
+    Ok(value)
+}
+
+pub(super) fn optional_f64_field(
+    map: &Map<String, Value>,
+    key: &str,
+    err_msg: &str,
+) -> Result<Option<f64>> {
+    match map.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| NotflixError::BadRequest(err_msg.to_string())),
+    }
+}
+
+pub(super) fn optional_f64_or(val: Option<&Value>, default: f64) -> Option<f64> {
+    match val {
+        None | Some(Value::Null) => Some(default),
+        Some(v) => v.as_f64(),
+    }
+}
+
+pub(super) fn optional_bool_or(map: &Map<String, Value>, key: &str, default: bool) -> bool {
+    map.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
+pub(super) fn optional_tristate_bool(map: &Map<String, Value>, key: &str) -> Option<bool> {
+    match map.get(key) {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_bool().unwrap_or(false)),
+    }
+}
+
+pub(super) fn require_episode(store: &NotflixStore, episode_id: &str) -> Result<EpisodeNode> {
+    store
+        .get_episode(episode_id)?
+        .ok_or_else(|| NotflixError::NotFound("Episode not found".to_string()))
+}
+
+pub(super) fn read_file_or_not_found(path: &Path, not_found_msg: &str) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            NotflixError::NotFound(not_found_msg.to_string())
+        } else {
+            NotflixError::Io(e)
+        }
+    })
 }
 
 pub(super) async fn run_blocking<F, T>(f: F) -> Result<T>

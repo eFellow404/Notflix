@@ -1,10 +1,12 @@
 import {
   api,
   byId,
+  encodePath,
   formatTime,
   hasValidIntro,
   hasValidOutro,
   parseTimeInput,
+  pluralize,
   showToast,
 } from "./utils.js";
 import {
@@ -29,11 +31,37 @@ const INTRO_SOURCE_LABELS = {
   manual: "manual",
 };
 
+const PHASE2_BATCH_SIZE = 8;
+const FFMPEG_POLL_INTERVAL_MS = 1500;
+const FFMPEG_POLL_MAX_MS = 180000;
+
+let dom = null;
+let lastSkipTimeText = "";
+
+function getDom() {
+  if (!dom) {
+    dom = {
+      video: byId("videoPlayer"),
+      skipIntroOverlay: byId("skipIntroOverlay"),
+      skipIntroTime: byId("skipIntroTime"),
+      upNextCard: byId("upNextCard"),
+      seekIntroRange: byId("seekIntroRange"),
+      seekOutroMarker: byId("seekOutroMarker"),
+      metaIntroStatus: byId("metaIntroStatus"),
+      introStartInput: byId("introStartInput"),
+      introEndInput: byId("introEndInput"),
+      introEditorBar: byId("introEditorBar"),
+      introEditorError: byId("introEditorError"),
+      detectIntrosBtn: byId("detectIntrosBtn"),
+    };
+  }
+  return dom;
+}
+
 export function updateSeekIntroHighlight() {
+  const { video, seekIntroRange, seekOutroMarker } = getDom();
   const ep = state.currentEpisode;
-  const seekIntroRange = byId("seekIntroRange");
-  const seekOutroMarker = byId("seekOutroMarker");
-  const dur = getEffectiveDuration(byId("videoPlayer"));
+  const dur = getEffectiveDuration(video);
 
   if (!hasValidIntro(ep) || !Number.isFinite(dur) || dur <= 0) {
     seekIntroRange.classList.add("hidden");
@@ -60,23 +88,27 @@ export function updateSeekIntroHighlight() {
 }
 
 export function updateSkipIntroVisibility() {
+  const { video, skipIntroOverlay, skipIntroTime, upNextCard } = getDom();
   const ep = state.currentEpisode;
-  const skipIntroOverlay = byId("skipIntroOverlay");
-  const upNextVisible = !byId("upNextCard").classList.contains("hidden");
-  if (!hasValidIntro(ep) || upNextVisible) {
-    skipIntroOverlay.classList.add("hidden");
-    return;
-  }
-  const cur = getEffectiveTime(byId("videoPlayer"));
-  const inIntro =
-    Number.isFinite(cur) &&
-    cur >= ep.intro_start_sec &&
-    cur < ep.intro_end_sec - 0.5;
+  const upNextVisible = !upNextCard.classList.contains("hidden");
+  let shouldShow = false;
 
-  if (inIntro) {
-    byId("skipIntroTime").textContent = `→ ${formatTime(ep.intro_end_sec)}`;
-    skipIntroOverlay.classList.remove("hidden");
-  } else {
+  if (hasValidIntro(ep) && !upNextVisible) {
+    const cur = getEffectiveTime(video);
+    shouldShow =
+      Number.isFinite(cur) && cur >= ep.intro_start_sec && cur < ep.intro_end_sec - 0.5;
+  }
+
+  if (shouldShow) {
+    const nextText = `→ ${formatTime(ep.intro_end_sec)}`;
+    if (nextText !== lastSkipTimeText) {
+      lastSkipTimeText = nextText;
+      skipIntroTime.textContent = nextText;
+    }
+    if (skipIntroOverlay.classList.contains("hidden")) {
+      skipIntroOverlay.classList.remove("hidden");
+    }
+  } else if (!skipIntroOverlay.classList.contains("hidden")) {
     skipIntroOverlay.classList.add("hidden");
   }
 }
@@ -84,7 +116,7 @@ export function updateSkipIntroVisibility() {
 export function skipIntro() {
   const ep = state.currentEpisode;
   if (!hasValidIntro(ep)) return;
-  const video = byId("videoPlayer");
+  const { video } = getDom();
   const dur = getEffectiveDuration(video);
   const target =
     Number.isFinite(dur) && dur > 1
@@ -101,8 +133,8 @@ export function skipIntro() {
 }
 
 export function refreshIntroUI(statusOverride = null) {
+  const { metaIntroStatus, introStartInput, introEndInput } = getDom();
   const ep = state.currentEpisode;
-  const metaIntroStatus = byId("metaIntroStatus");
   if (statusOverride) {
     metaIntroStatus.textContent = statusOverride;
   } else if (hasValidIntro(ep)) {
@@ -115,8 +147,6 @@ export function refreshIntroUI(statusOverride = null) {
     metaIntroStatus.textContent = "Not detected yet";
   }
 
-  const introStartInput = byId("introStartInput");
-  const introEndInput = byId("introEndInput");
   if (hasValidIntro(ep)) {
     introStartInput.value = formatTime(ep.intro_start_sec);
     introEndInput.value = formatTime(ep.intro_end_sec);
@@ -139,176 +169,46 @@ function syncEpisodeIntroFromLinkedList() {
   callbacks.onIntroUpdated();
 }
 
-export async function extractVisualFingerprint(episode, isCancelled) {
-  return new Promise((resolve) => {
-    const vid = document.createElement("video");
-    vid.muted = true;
-    vid.playsInline = true;
-    vid.preload = "auto";
-    vid.crossOrigin = "anonymous";
-
-    const GRID_W = 6;
-    const GRID_H = 4;
-    const VEC_LEN = GRID_W * GRID_H * 3;
-    const canvas = document.createElement("canvas");
-    canvas.width = GRID_W;
-    canvas.height = GRID_H;
-    const ctx = canvas.getContext("2d", { willReadFrequently: true });
-
-    let finished = false;
-    const cleanup = (result) => {
-      if (finished) return;
-      finished = true;
-      vid.onloadedmetadata = null;
-      vid.onerror = null;
-      vid.onseeked = null;
-      vid.pause();
-      vid.removeAttribute("src");
-      vid.load();
-      resolve(result);
-    };
-
-    const loadTimer = setTimeout(() => cleanup(null), 12000);
-
-    vid.onerror = () => {
-      clearTimeout(loadTimer);
-      cleanup(null);
-    };
-
-    vid.onloadedmetadata = async () => {
-      clearTimeout(loadTimer);
-      if (isCancelled() || !Number.isFinite(vid.duration) || vid.duration < 14) {
-        cleanup(null);
-        return;
-      }
-
-      const duration = vid.duration;
-      const scanLimit = Math.min(duration - 0.5, 360);
-      const step = 1.0;
-      const vectors = [];
-      const flatFlags = [];
-
-      const seekTo = (t) =>
-        new Promise((res) => {
-          if (Math.abs(vid.currentTime - t) < 0.02 && vid.readyState >= 2) {
-            res(true);
-            return;
-          }
-          let done = false;
-          const timer = setTimeout(() => {
-            if (!done) {
-              done = true;
-              vid.onseeked = null;
-              res(false);
-            }
-          }, 3500);
-          vid.onseeked = () => {
-            if (!done) {
-              done = true;
-              clearTimeout(timer);
-              vid.onseeked = null;
-              res(true);
-            }
-          };
-          try {
-            vid.currentTime = t;
-          } catch {
-            clearTimeout(timer);
-            res(false);
-          }
-        });
-
-      const vw = vid.videoWidth || 0;
-      const vh = vid.videoHeight || 0;
-      // Crop outer 12% margin so DVD letterbox/pillarbox black bars never bias frame similarity
-      const cropX = vw > 0 ? Math.round(vw * 0.12) : 0;
-      const cropY = vh > 0 ? Math.round(vh * 0.12) : 0;
-      const cropW = vw > 0 ? Math.max(1, vw - cropX * 2) : 0;
-      const cropH = vh > 0 ? Math.max(1, vh - cropY * 2) : 0;
-
-      const sampleFrame = async (t) => {
-        const ok = await seekTo(t);
-        if (!ok || !ctx) {
-          return { vec: new Array(VEC_LEN).fill(0), isFlat: true };
-        }
-        try {
-          if (cropW > 0 && cropH > 0) {
-            ctx.drawImage(vid, cropX, cropY, cropW, cropH, 0, 0, GRID_W, GRID_H);
-          } else {
-            ctx.drawImage(vid, 0, 0, GRID_W, GRID_H);
-          }
-          const pixels = ctx.getImageData(0, 0, GRID_W, GRID_H).data;
-          const vec = [];
-          let sum = 0;
-          for (let p = 0; p < pixels.length; p += 4) {
-            const r = pixels[p];
-            const g = pixels[p + 1];
-            const b = pixels[p + 2];
-            vec.push(r, g, b);
-            sum += r + g + b;
-          }
-          const mean = sum / vec.length;
-          let varSum = 0;
-          for (let k = 0; k < vec.length; k++) {
-            const d = vec[k] - mean;
-            varSum += d * d;
-          }
-          return { vec, isFlat: Math.sqrt(varSum / vec.length) < 8.0 };
-        } catch {
-          return { vec: new Array(VEC_LEN).fill(0), isFlat: true };
-        }
-      };
-
-      for (let t = 0; t < scanLimit; t += step) {
-        if (isCancelled()) {
-          cleanup(null);
-          return;
-        }
-        const { vec, isFlat } = await sampleFrame(t);
-        vectors.push(vec);
-        flatFlags.push(isFlat);
-      }
-
-      let tailFingerprint = null;
-      if (duration >= 240) {
-        const tailStep = 1.5;
-        const tailStart = Math.max(0, duration - 120);
-        const tailEnd = duration - 0.5;
-        const tailVectors = [];
-        const tailFlatFlags = [];
-        for (let t = tailStart; t < tailEnd; t += tailStep) {
-          if (isCancelled()) {
-            cleanup(null);
-            return;
-          }
-          const { vec, isFlat } = await sampleFrame(t);
-          tailVectors.push(vec);
-          tailFlatFlags.push(isFlat);
-        }
-        if (tailVectors.length > 0) {
-          tailFingerprint = {
-            episode_id: episode.id,
-            step_sec: tailStep,
-            vectors: tailVectors,
-            flat_flags: tailFlatFlags,
-            duration_sec: duration,
-          };
-        }
-      }
-
-      cleanup({
-        episode_id: episode.id,
-        step_sec: step,
-        vectors,
-        flat_flags: flatFlags,
-        duration_sec: duration,
-        tailFingerprint,
-      });
-    };
-
-    vid.src = `/api/episodes/${episode.id}/stream`;
-    vid.load();
+async function postDetectIntros(showId, body, isCancelled) {
+  const res = await api(`/api/shows/${encodePath(showId)}/detect-intros`, {
+    method: "POST",
+    body: JSON.stringify(body),
   });
+  if (isCancelled()) return null;
+  state.activeShow = res.show;
+  setLinkedList(res.linked_list);
+  syncEpisodeIntroFromLinkedList();
+  return res;
+}
+
+async function scanReferenceBatch(targets, visual, isCancelled) {
+  const heads = [];
+  const tails = [];
+  for (let i = 0; i < targets.length; i++) {
+    if (isCancelled()) return null;
+    refreshIntroUI(`Scanning reference episodes (${i + 1}/${targets.length})…`);
+    const fp = await visual.extractVisualFingerprint(targets[i], isCancelled);
+    if (isCancelled()) return null;
+    if (fp) {
+      const { tailFingerprint, ...headFp } = fp;
+      heads.push(headFp);
+      if (tailFingerprint) tails.push(tailFingerprint);
+    }
+  }
+  return { heads, tails };
+}
+
+function showVisualScanCompletionToast(totalDetected, silent) {
+  if (totalDetected > 0) {
+    showToast(`Detected intro on ${pluralize(totalDetected, "episode")}`, "success");
+  } else if (!silent) {
+    showToast("No shared intro found across episodes — you can mark one manually with Set.");
+  }
+}
+
+export async function extractVisualFingerprint(episode, isCancelled) {
+  const visual = await import("./intro-visual.js");
+  return visual.extractVisualFingerprint(episode, isCancelled);
 }
 
 export async function runBrowserVisualIntroScan(showId, { force = false, silent = false, token }) {
@@ -324,116 +224,232 @@ export async function runBrowserVisualIntroScan(showId, { force = false, silent 
     return;
   }
 
-  const curId = state.currentEpisode?.id;
-  const prioritized = [...pool];
-  if (curId) {
-    const idx = prioritized.findIndex((e) => e.id === curId);
-    if (idx > 0) {
-      const [curEp] = prioritized.splice(idx, 1);
-      prioritized.unshift(curEp);
-    }
-  }
-  const targets = prioritized.slice(0, 24);
-  const collected = [];
-  const collectedTails = [];
-  const firstBatchSize = Math.min(4, targets.length);
-
-  for (let i = 0; i < targets.length; i++) {
-    if (isCancelled()) return;
-    const ep = targets[i];
-    refreshIntroUI(`Scanning episodes (${i + 1}/${targets.length})…`);
-    const fp = await extractVisualFingerprint(ep, isCancelled);
-    if (isCancelled()) return;
-    if (fp) {
-      const { tailFingerprint, ...headFp } = fp;
-      collected.push(headFp);
-      if (tailFingerprint) collectedTails.push(tailFingerprint);
-    }
-
-    if (i + 1 === firstBatchSize && targets.length > firstBatchSize && collected.length >= 2) {
-      try {
-        const partialBody = {
-          fingerprints: collected,
-          force,
-          mark_scanned: false,
-        };
-        if (collectedTails.length >= 2) {
-          partialBody.tail_fingerprints = collectedTails;
-        }
-        const partial = await api(`/api/shows/${showId}/detect-intros`, {
-          method: "POST",
-          body: JSON.stringify(partialBody),
-        });
-        if (isCancelled()) return;
-        state.activeShow = partial.show;
-        setLinkedList(partial.linked_list);
-        syncEpisodeIntroFromLinkedList();
-      } catch {
-        // Continue to final pass
-      }
-    }
-  }
-
+  const visual = await import("./intro-visual.js");
   if (isCancelled()) return;
-  if (collected.length < 2) {
+
+  const curId = state.currentEpisode?.id || null;
+  const { refTargets, remainingTargets: initialRemaining } = visual.selectReferenceEpisodes(
+    pool,
+    curId,
+    5
+  );
+  let remainingTargets = initialRemaining;
+
+  // Phase 1: Dense reference scan on up to 5 evenly-spaced episodes
+  const phase1Scan = await scanReferenceBatch(refTargets, visual, isCancelled);
+  if (!phase1Scan) return;
+  const refCollected = phase1Scan.heads;
+  const refTails = phase1Scan.tails;
+
+  if (refCollected.length < 2 && remainingTargets.length === 0) {
     refreshIntroUI("Could not decode ≥2 episodes");
     if (!silent) showToast("Could not decode enough episodes to compare for an intro.");
     return;
   }
 
-  refreshIntroUI("Matching shared intro…");
-  const finalBody = {
-    fingerprints: collected,
-    force,
-    mark_scanned: true,
-  };
-  if (collectedTails.length >= 2) {
-    finalBody.tail_fingerprints = collectedTails;
+  const isValidTemplate = (tmpl) =>
+    Boolean(tmpl && Array.isArray(tmpl.vectors) && tmpl.vectors.length > 0);
+
+  let introTemplate = null;
+  let totalDetected = 0;
+  let didMarkScanned = false;
+
+  if (refCollected.length >= 2) {
+    refreshIntroUI("Matching shared intro…");
+    const markScannedNow = remainingTargets.length === 0;
+    const phase1Body = {
+      fingerprints: refCollected,
+      force,
+      mark_scanned: markScannedNow,
+    };
+    if (refTails.length >= 2) {
+      phase1Body.tail_fingerprints = refTails;
+    }
+    const phase1Res = await postDetectIntros(showId, phase1Body, isCancelled);
+    if (!phase1Res) return;
+    if (markScannedNow) didMarkScanned = true;
+    totalDetected += phase1Res.detected_count || 0;
+    if (isValidTemplate(phase1Res.intro_template)) {
+      introTemplate = phase1Res.intro_template;
+    }
   }
-  const finalRes = await api(`/api/shows/${showId}/detect-intros`, {
-    method: "POST",
-    body: JSON.stringify(finalBody),
-  });
-  if (isCancelled()) return;
 
-  state.activeShow = finalRes.show;
-  setLinkedList(finalRes.linked_list);
-  syncEpisodeIntroFromLinkedList();
-
-  if (finalRes.detected_count > 0) {
-    showToast(
-      `Detected intro on ${finalRes.detected_count} episode${finalRes.detected_count === 1 ? "" : "s"}`,
-      "success"
+  // Fallback retry: if no template discovered yet, scan up to 3 more evenly-spaced episodes densely
+  if (!introTemplate && remainingTargets.length > 0) {
+    const { refTargets: extraRefs, remainingTargets: afterExtra } = visual.selectReferenceEpisodes(
+      remainingTargets,
+      null,
+      3
     );
-  } else if (!silent) {
-    showToast("No shared intro found across episodes — you can mark one manually with Set.");
+    remainingTargets = afterExtra;
+
+    const retryScan = await scanReferenceBatch(extraRefs, visual, isCancelled);
+    if (!retryScan) return;
+    // Place newly scanned episodes first so they are guaranteed to be inside the server's
+    // 6-episode reference window even if earlier episodes were intro-less specials/pilots.
+    refCollected.unshift(...retryScan.heads);
+    refTails.push(...retryScan.tails);
+
+    if (refCollected.length < 2) {
+      refreshIntroUI("Could not decode ≥2 episodes");
+      if (!silent) showToast("Could not decode enough episodes to compare for an intro.");
+      return;
+    }
+
+    refreshIntroUI("Matching shared intro…");
+    const markScannedNow = remainingTargets.length === 0;
+    const retryBody = {
+      fingerprints: refCollected,
+      force,
+      mark_scanned: markScannedNow,
+    };
+    if (refTails.length >= 2) {
+      retryBody.tail_fingerprints = refTails;
+    }
+    const retryRes = await postDetectIntros(showId, retryBody, isCancelled);
+    if (!retryRes) return;
+    if (markScannedNow) didMarkScanned = true;
+    totalDetected = Math.max(totalDetected, retryRes.detected_count || 0);
+    if (isValidTemplate(retryRes.intro_template)) {
+      introTemplate = retryRes.intro_template;
+    }
   }
+
+  if (!introTemplate) {
+    if (!didMarkScanned) {
+      try {
+        const finalized = await postDetectIntros(
+          showId,
+          { fingerprints: [], force, mark_scanned: true },
+          isCancelled
+        );
+        if (!finalized) return;
+      } catch {
+        // Best-effort scan completion marker
+      }
+    }
+    refreshIntroUI();
+    showVisualScanCompletionToast(totalDetected, silent);
+    return;
+  }
+
+  // Phase 2: Fast 5s-block coarse localization + focused fine window across ALL remaining episodes
+  if (remainingTargets.length > 0) {
+    const anchorTails = refTails.slice(0, 2);
+    let pendingFps = [];
+    let pendingTails = [];
+
+    for (let i = 0; i < remainingTargets.length; i++) {
+      if (isCancelled()) return;
+      refreshIntroUI(`Finding intro in episodes (${i + 1}/${remainingTargets.length})…`);
+      const extracted = await visual.extractWindowedFingerprint(
+        remainingTargets[i],
+        introTemplate,
+        isCancelled
+      );
+      if (isCancelled()) return;
+
+      if (extracted) {
+        if (extracted.fingerprint) pendingFps.push(extracted.fingerprint);
+        if (extracted.tailFingerprint) pendingTails.push(extracted.tailFingerprint);
+      }
+
+      const isLast = i === remainingTargets.length - 1;
+      if (pendingFps.length >= PHASE2_BATCH_SIZE || isLast) {
+        const batchBody = {
+          fingerprints: pendingFps,
+          intro_template: introTemplate,
+          force,
+          mark_scanned: isLast,
+        };
+        if (pendingTails.length >= 2) {
+          batchBody.tail_fingerprints = pendingTails;
+        } else if (pendingTails.length === 1 && anchorTails.length >= 1) {
+          batchBody.tail_fingerprints = [...pendingTails, ...anchorTails];
+        }
+
+        const batchRes = await postDetectIntros(showId, batchBody, isCancelled);
+        if (!batchRes) return;
+        if (isLast) didMarkScanned = true;
+        totalDetected += batchRes.detected_count || 0;
+        pendingFps = [];
+        pendingTails = [];
+      }
+    }
+  }
+
+  refreshIntroUI();
+  showVisualScanCompletionToast(totalDetected, silent);
+}
+
+async function waitForFfmpegDownload(token, showId, initialProgress) {
+  const isCancelled = () =>
+    token !== state.introScanToken || !state.activeShow || state.activeShow.id !== showId;
+
+  const updateProgressUI = (rawPct) => {
+    const pct = typeof rawPct === "number" && Number.isFinite(rawPct) ? Math.round(rawPct) : null;
+    refreshIntroUI(
+      pct !== null ? `Downloading audio engine (${pct}%)…` : "Downloading audio engine…"
+    );
+  };
+
+  updateProgressUI(initialProgress);
+  const deadline = Date.now() + FFMPEG_POLL_MAX_MS;
+
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, FFMPEG_POLL_INTERVAL_MS));
+    if (isCancelled()) return { cancelled: true, ffmpegAvailable: false };
+
+    let health;
+    try {
+      health = await api("/api/health");
+    } catch {
+      return { cancelled: isCancelled(), ffmpegAvailable: false };
+    }
+    if (isCancelled()) return { cancelled: true, ffmpegAvailable: false };
+
+    if (health.ffmpeg_available) {
+      return { cancelled: false, ffmpegAvailable: true };
+    }
+    if (health.ffmpeg_status !== "downloading") {
+      return { cancelled: false, ffmpegAvailable: false };
+    }
+    updateProgressUI(health.ffmpeg_progress);
+  }
+
+  return { cancelled: isCancelled(), ffmpegAvailable: false };
 }
 
 export async function runIntroDetection(showId, { force = false, silent = false } = {}) {
   const token = ++state.introScanToken;
+  const isCancelled = () =>
+    token !== state.introScanToken || !state.activeShow || state.activeShow.id !== showId;
   state.introScanning = true;
-  const detectBtn = byId("detectIntrosBtn");
-  detectBtn.disabled = true;
-  detectBtn.textContent = "Scanning…";
+  const { detectIntrosBtn } = getDom();
+  detectIntrosBtn.disabled = true;
+  detectIntrosBtn.textContent = "Scanning…";
   refreshIntroUI("Checking chapters & episodes…");
 
   try {
-    const res = await api(`/api/shows/${showId}/detect-intros`, {
-      method: "POST",
-      body: JSON.stringify({ force }),
-    });
-    if (token !== state.introScanToken) return;
+    let res = await postDetectIntros(showId, { force }, () => token !== state.introScanToken);
+    if (!res) return;
 
-    state.activeShow = res.show;
-    setLinkedList(res.linked_list);
-    syncEpisodeIntroFromLinkedList();
+    if (res.needs_client_visual_scan && res.ffmpeg_downloading) {
+      const waitRes = await waitForFfmpegDownload(token, showId, res.ffmpeg_progress);
+      if (waitRes.cancelled) return;
+
+      if (waitRes.ffmpegAvailable) {
+        refreshIntroUI("Analyzing episode audio…");
+        res = await postDetectIntros(showId, { force }, isCancelled);
+        if (!res) return;
+      }
+    }
 
     if (res.needs_client_visual_scan) {
       await runBrowserVisualIntroScan(showId, { force, silent, token });
     } else if (res.detected_count > 0) {
       showToast(
-        `Detected intros on ${res.detected_count} episode${res.detected_count === 1 ? "" : "s"} (${res.method})`,
+        `Detected intros on ${pluralize(res.detected_count, "episode")} (${res.method})`,
         "success"
       );
     } else if (!silent) {
@@ -447,8 +463,8 @@ export async function runIntroDetection(showId, { force = false, silent = false 
   } finally {
     if (token === state.introScanToken) {
       state.introScanning = false;
-      detectBtn.disabled = false;
-      detectBtn.textContent = "✦ Detect";
+      detectIntrosBtn.disabled = false;
+      detectIntrosBtn.textContent = "✦ Detect";
     }
   }
 }
@@ -456,11 +472,11 @@ export async function runIntroDetection(showId, { force = false, silent = false 
 async function saveManualIntro() {
   const ep = state.currentEpisode;
   if (!ep) return false;
-  const introEditorError = byId("introEditorError");
+  const { introEditorError, introStartInput, introEndInput } = getDom();
   introEditorError.classList.add("hidden");
 
-  const startSec = parseTimeInput(byId("introStartInput").value);
-  const endSec = parseTimeInput(byId("introEndInput").value);
+  const startSec = parseTimeInput(introStartInput.value);
+  const endSec = parseTimeInput(introEndInput.value);
   if (startSec === null || endSec === null || endSec <= startSec + 1) {
     introEditorError.textContent = "Enter valid start & end times (e.g. 0:30 and 1:30).";
     introEditorError.classList.remove("hidden");
@@ -468,7 +484,7 @@ async function saveManualIntro() {
   }
 
   try {
-    const res = await api(`/api/episodes/${ep.id}/intro`, {
+    const res = await api(`/api/episodes/${encodePath(ep.id)}/intro`, {
       method: "PATCH",
       body: JSON.stringify({ intro_start_sec: startSec, intro_end_sec: endSec }),
     });
@@ -486,12 +502,14 @@ async function saveManualIntro() {
 
 export function initIntro(hooks = {}) {
   callbacks = { ...callbacks, ...hooks };
-
-  const videoPlayer = byId("videoPlayer");
-  const introEditorBar = byId("introEditorBar");
-  const introEditorError = byId("introEditorError");
-  const introStartInput = byId("introStartInput");
-  const introEndInput = byId("introEndInput");
+  const {
+    video: videoPlayer,
+    introEditorBar,
+    introEditorError,
+    introStartInput,
+    introEndInput,
+    detectIntrosBtn,
+  } = getDom();
   const skipIntroBtn = byId("skipIntroBtn");
 
   skipIntroBtn.addEventListener("click", (ev) => {
@@ -500,7 +518,7 @@ export function initIntro(hooks = {}) {
     skipIntro();
   });
 
-  byId("detectIntrosBtn").addEventListener("click", () => {
+  detectIntrosBtn.addEventListener("click", () => {
     if (!state.activeShow || state.introScanning) return;
     runIntroDetection(state.activeShow.id, { force: false, silent: false });
   });
@@ -566,7 +584,7 @@ export function initIntro(hooks = {}) {
     const ep = state.currentEpisode;
     if (!ep) return;
     try {
-      const res = await api(`/api/episodes/${ep.id}/intro`, {
+      const res = await api(`/api/episodes/${encodePath(ep.id)}/intro`, {
         method: "PATCH",
         body: JSON.stringify({ clear: true }),
       });

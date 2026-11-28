@@ -1,8 +1,7 @@
 import {
-  ICONS,
-  PLAYBACK_SPEEDS,
   api,
   byId,
+  encodePath,
   formatTime,
   hasValidIntro,
   hasValidOutro,
@@ -20,251 +19,35 @@ import {
 import {
   refreshIntroUI,
   runIntroDetection,
-  skipIntro,
   updateSeekIntroHighlight,
   updateSkipIntroVisibility,
 } from "./intro.js";
 import { renderSeasonSidebar, resetSidebarFilters } from "./sidebar.js";
+import {
+  clearVideoSubtitles,
+  initPlayerTracks,
+  loadEpisodeTracks,
+  startRemuxStream,
+  syncSubtitleTrackModes,
+  updateAudioButtonUI,
+} from "./player-tracks.js";
+import {
+  clearControlsTimers,
+  exitFullscreenSafe,
+  initPlayerControls,
+  showControlsTemporarily,
+  updatePlayerControlsUI,
+  updateTimeAndSeekUI,
+  updateTransportStateUI,
+} from "./player-controls.js";
 
-const SUBTITLE_PREF_KEY = "notflix.subtitles";
+export { updatePlayerControlsUI };
 
 let callbacks = {
   onBackToLibrary: async () => {},
   isAnyModalOpen: () => false,
   closeOpenModal: () => false,
 };
-
-function readSubtitlePref() {
-  try {
-    const raw = localStorage.getItem(SUBTITLE_PREF_KEY);
-    if (!raw) return { enabled: false, lang: "" };
-    const parsed = JSON.parse(raw);
-    return {
-      enabled: Boolean(parsed?.enabled),
-      lang: typeof parsed?.lang === "string" ? parsed.lang : "",
-    };
-  } catch {
-    return { enabled: false, lang: "" };
-  }
-}
-
-function saveSubtitlePref(enabled, lang = "") {
-  try {
-    localStorage.setItem(SUBTITLE_PREF_KEY, JSON.stringify({ enabled: Boolean(enabled), lang: lang || "" }));
-  } catch {
-    // Ignore storage errors
-  }
-}
-
-function syncSubtitleTrackModes() {
-  const video = byId("videoPlayer");
-  const tracks = video.textTracks;
-  if (tracks) {
-    for (let i = 0; i < tracks.length; i++) {
-      tracks[i].mode = i === state.activeSubtitleIndex ? "showing" : "disabled";
-    }
-  }
-  const btn = byId("ctrlSubBtn");
-  if (!btn) return;
-  const hasSubs = state.subtitleTracks.length > 0;
-  btn.classList.toggle("hidden", !hasSubs);
-  const enabled = hasSubs && state.activeSubtitleIndex >= 0;
-  btn.classList.toggle("active", enabled);
-  btn.classList.toggle("is-on", enabled);
-  if (enabled) {
-    const t = state.subtitleTracks[state.activeSubtitleIndex];
-    btn.title = `Subtitles: ${t?.label || "On"} (C)`;
-  } else {
-    btn.title = "Subtitles: Off (C)";
-  }
-}
-
-function updateAudioButtonUI() {
-  const btn = byId("ctrlAudioBtn");
-  if (!btn) return;
-  const showBtn = state.audioTracks.length > 1 || state.needsRemuxHint || state.remuxMode;
-  btn.classList.toggle("hidden", !showBtn);
-  btn.classList.toggle("active", state.remuxMode);
-  btn.classList.toggle("is-on", state.remuxMode);
-  if (!showBtn) return;
-
-  const currentTrack =
-    state.audioTracks.find((t) => t.index === state.activeAudioIndex) || state.audioTracks[0];
-  if (state.audioTracks.length > 1 && currentTrack) {
-    const shortLang = (currentTrack.language || `T${currentTrack.index + 1}`).toUpperCase().slice(0, 6);
-    btn.textContent = `♪ ${shortLang}`;
-    const desc = currentTrack.title || currentTrack.language || `Track ${currentTrack.index + 1}`;
-    btn.title = `Audio: ${desc} (${(currentTrack.codec || "").toUpperCase()}) — click to switch`;
-  } else if (state.remuxMode) {
-    btn.textContent = "♪ Remux";
-    btn.title = "Playing via ffmpeg remux — click to return to direct stream";
-  } else {
-    btn.textContent = "♪ Remux";
-    btn.title = "Incompatible audio codec detected — click to remux with ffmpeg";
-  }
-}
-
-function clearVideoSubtitles() {
-  const video = byId("videoPlayer");
-  for (const el of video.querySelectorAll("track")) {
-    el.remove();
-  }
-  state.subtitleTracks = [];
-  state.activeSubtitleIndex = -1;
-  syncSubtitleTrackModes();
-}
-
-async function loadEpisodeTracks(episodeId, token) {
-  try {
-    const data = await api(`/api/episodes/${episodeId}/tracks`);
-    if (token !== state.tracksRequestToken || state.currentEpisode?.id !== episodeId) return;
-
-    const subtitles = Array.isArray(data.subtitles) ? data.subtitles : [];
-    const audio = Array.isArray(data.audio) ? data.audio : [];
-    state.subtitleTracks = subtitles;
-    state.audioTracks = audio;
-    state.needsRemuxHint = Boolean(data.needs_remux_hint);
-    if (audio.length > 0 && !audio.some((t) => t.index === state.activeAudioIndex)) {
-      state.activeAudioIndex = audio[0].index;
-    }
-
-    const video = byId("videoPlayer");
-    for (const old of video.querySelectorAll("track")) old.remove();
-    for (const t of subtitles) {
-      const tr = document.createElement("track");
-      tr.kind = "subtitles";
-      tr.label = t.label || t.lang || `Track ${t.index + 1}`;
-      tr.srclang = t.lang || "und";
-      tr.src = `/api/episodes/${episodeId}/subtitles/${t.index}`;
-      video.appendChild(tr);
-    }
-
-    const pref = readSubtitlePref();
-    if (pref.enabled && subtitles.length > 0) {
-      let idx = -1;
-      if (pref.lang) {
-        const wanted = pref.lang.toLowerCase();
-        idx = subtitles.findIndex((t) => (t.lang || "").toLowerCase() === wanted);
-      }
-      state.activeSubtitleIndex = idx >= 0 ? idx : 0;
-    } else {
-      state.activeSubtitleIndex = -1;
-    }
-
-    syncSubtitleTrackModes();
-    updateAudioButtonUI();
-  } catch {
-    // Non-fatal: tracks endpoint failure should not disrupt playback
-  }
-}
-
-function cycleSubtitles({ fromKeyboard = false } = {}) {
-  if (state.subtitleTracks.length === 0) {
-    if (fromKeyboard) showToast("No subtitles available for this episode");
-    return;
-  }
-  if (state.activeSubtitleIndex < 0) {
-    state.activeSubtitleIndex = 0;
-  } else if (state.activeSubtitleIndex + 1 < state.subtitleTracks.length) {
-    state.activeSubtitleIndex += 1;
-  } else {
-    state.activeSubtitleIndex = -1;
-  }
-
-  syncSubtitleTrackModes();
-  if (state.activeSubtitleIndex >= 0) {
-    const track = state.subtitleTracks[state.activeSubtitleIndex];
-    const label = track.label || track.lang || `Track ${track.index + 1}`;
-    saveSubtitlePref(true, track.lang || "");
-    showToast(`Subtitles: ${label}`);
-  } else {
-    saveSubtitlePref(false, "");
-    showToast("Subtitles: Off");
-  }
-}
-
-async function startRemuxStream(ep, startSec = 0, audioIdx = 0, { autoPlay = true } = {}) {
-  if (!ep) return false;
-  const offset = Math.max(0, Math.floor(Number.isFinite(startSec) ? startSec : 0));
-  const url = `/api/episodes/${ep.id}/stream?remux=1&start=${offset}&audio=${audioIdx}`;
-
-  if (!state.ffmpegAvailable) {
-    const controller = new AbortController();
-    try {
-      const res = await fetch(url, { signal: controller.signal });
-      if (res.status === 501) {
-        const data = await res.json().catch(() => ({}));
-        showToast(data.error || "Remux unavailable: ffmpeg is not installed on the server.");
-        return false;
-      }
-      controller.abort();
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        showToast(data.error || `Remux failed (${res.status})`);
-        return false;
-      }
-      state.ffmpegAvailable = true;
-    } catch (err) {
-      if (err?.name !== "AbortError") {
-        showToast(`Remux unavailable: ${err.message}`);
-        return false;
-      }
-    }
-  }
-
-  const video = byId("videoPlayer");
-  state.remuxMode = true;
-  state.remuxOffsetSec = offset;
-  state.activeAudioIndex = audioIdx;
-  state.pendingSeekSec = null;
-  state.pendingRemuxSeekSec = null;
-  state.autoPlayOnLoad = autoPlay;
-
-  byId("playerErrorBanner").classList.add("hidden");
-  video.pause();
-  video.src = url;
-  video.load();
-
-  updateAudioButtonUI();
-  updatePlayerControlsUI();
-  return true;
-}
-
-async function cycleAudioTrack() {
-  const ep = state.currentEpisode;
-  if (!ep) return;
-  const video = byId("videoPlayer");
-  const pos = getEffectiveTime(video);
-
-  if (state.audioTracks.length > 1) {
-    const curPos = state.audioTracks.findIndex((t) => t.index === state.activeAudioIndex);
-    const nextTrack = state.audioTracks[(curPos + 1) % state.audioTracks.length];
-    const ok = await startRemuxStream(ep, pos, nextTrack.index, { autoPlay: !video.paused || true });
-    if (ok) {
-      const desc = nextTrack.title || nextTrack.language || `Track ${nextTrack.index + 1}`;
-      const codec = nextTrack.codec ? ` (${nextTrack.codec.toUpperCase()})` : "";
-      showToast(`Audio: ${desc}${codec}`);
-    }
-    return;
-  }
-
-  if (!state.remuxMode) {
-    const audioIdx = state.audioTracks[0]?.index ?? 0;
-    const ok = await startRemuxStream(ep, pos, audioIdx, { autoPlay: true });
-    if (ok) showToast("Remuxing audio stream for browser playback");
-  } else {
-    state.remuxMode = false;
-    state.remuxOffsetSec = 0;
-    state.pendingSeekSec = pos;
-    state.autoPlayOnLoad = true;
-    byId("playerErrorBanner").classList.add("hidden");
-    video.pause();
-    video.src = `/api/episodes/${ep.id}/stream`;
-    video.load();
-    updateAudioButtonUI();
-    showToast("Switched back to direct stream");
-  }
-}
 
 export function seekToTime(targetSec, { autoPlay = null } = {}) {
   const video = byId("videoPlayer");
@@ -279,34 +62,8 @@ export function seekToTime(targetSec, { autoPlay = null } = {}) {
   if (autoPlay === true) {
     video.play().catch(() => {});
   }
-  updatePlayerControlsUI();
+  updateTimeAndSeekUI();
   updateSkipIntroVisibility();
-}
-
-function attachEpisodeThumbnails() {
-  const list = byId("episodeList");
-  if (!list) return;
-  for (const card of list.querySelectorAll(".ep-row-card[data-select-ep]")) {
-    const epId = card.dataset.selectEp;
-    const main = card.querySelector(".ep-row-main");
-    if (!epId || !main || main.querySelector(".ep-thumb")) continue;
-    const img = document.createElement("img");
-    img.className = "ep-thumb";
-    img.src = `/api/episodes/${epId}/thumbnail`;
-    img.alt = "";
-    img.loading = "lazy";
-    img.addEventListener("load", () => img.classList.add("loaded"), { once: true });
-    img.addEventListener("error", () => img.remove(), { once: true });
-    main.insertBefore(img, main.firstChild);
-  }
-}
-
-function installEpisodeThumbnailObserver() {
-  const list = byId("episodeList");
-  if (!list || typeof MutationObserver === "undefined") return;
-  const observer = new MutationObserver(() => attachEpisodeThumbnails());
-  observer.observe(list, { childList: true });
-  attachEpisodeThumbnails();
 }
 
 export function setView(viewName) {
@@ -318,6 +75,7 @@ export function setView(viewName) {
 }
 
 function cancelAutoplayCountdown() {
+  if (!state.autoplayTimer && state.autoplayCountdown === 0) return;
   if (state.autoplayTimer) {
     clearInterval(state.autoplayTimer);
     state.autoplayTimer = null;
@@ -403,7 +161,8 @@ export function loadEpisode(episode, { autoPlay = true, forceStartZero = false }
 
   let startAt = 0;
   if (!forceStartZero && canonical.position_sec > 1) {
-    const nearEnd = canonical.duration_sec > 0 && canonical.position_sec >= canonical.duration_sec * 0.95;
+    const nearEnd =
+      canonical.duration_sec > 0 && canonical.position_sec >= canonical.duration_sec * 0.95;
     startAt = nearEnd ? 0 : canonical.position_sec;
   }
   state.pendingSeekSec = startAt;
@@ -431,7 +190,7 @@ export function loadEpisode(episode, { autoPlay = true, forceStartZero = false }
 
   const videoPlayer = byId("videoPlayer");
   videoPlayer.pause();
-  videoPlayer.src = `/api/episodes/${canonical.id}/stream`;
+  videoPlayer.src = `/api/episodes/${encodePath(canonical.id)}/stream`;
   videoPlayer.load();
 
   const tracksToken = ++state.tracksRequestToken;
@@ -444,7 +203,8 @@ export function loadEpisode(episode, { autoPlay = true, forceStartZero = false }
 
 export async function openShow(showId, opts = {}) {
   try {
-    const data = await api(`/api/shows/${showId}?autosync=1`);
+    const encodedId = encodePath(showId);
+    const data = await api(`/api/shows/${encodedId}?autosync=1`);
     state.activeShow = data.show;
     setLinkedList(data.linked_list);
     resetSidebarFilters();
@@ -459,7 +219,7 @@ export async function openShow(showId, opts = {}) {
     }
 
     if (opts.advanceNextImmediately) {
-      const nextData = await api(`/api/shows/${showId}/next`, { method: "POST", body: "{}" });
+      const nextData = await api(`/api/shows/${encodedId}/next`, { method: "POST", body: "{}" });
       setLinkedList(nextData.linked_list);
     }
 
@@ -484,121 +244,6 @@ export async function openShow(showId, opts = {}) {
   }
 }
 
-/* ==================== CUSTOM CINEMA CONTROLS & FULLSCREEN ==================== */
-
-function isStageFullscreen() {
-  const stage = byId("playerStage");
-  return document.fullscreenElement === stage || document.webkitFullscreenElement === stage;
-}
-
-function toggleFullscreen() {
-  const stage = byId("playerStage");
-  if (document.fullscreenElement || document.webkitFullscreenElement) {
-    (document.exitFullscreen || document.webkitExitFullscreen)?.call(document)?.catch?.(() => {});
-  } else {
-    const req = stage.requestFullscreen || stage.webkitRequestFullscreen;
-    req?.call(stage)?.catch?.(() => {});
-  }
-}
-
-function showControlsTemporarily() {
-  const stage = byId("playerStage");
-  const video = byId("videoPlayer");
-  stage.classList.remove("controls-hidden");
-  if (state.controlsHideTimer) {
-    clearTimeout(state.controlsHideTimer);
-    state.controlsHideTimer = null;
-  }
-  if (!video.paused && !state.isSeeking) {
-    state.controlsHideTimer = setTimeout(() => {
-      if (!video.paused && !state.isSeeking) {
-        stage.classList.add("controls-hidden");
-      }
-    }, 2600);
-  }
-}
-
-function togglePlayPause() {
-  const video = byId("videoPlayer");
-  if (video.paused) {
-    video.play().catch(() => {});
-  } else {
-    video.pause();
-  }
-  showControlsTemporarily();
-}
-
-function toggleMute() {
-  const video = byId("videoPlayer");
-  video.muted = !video.muted;
-  updatePlayerControlsUI();
-  showControlsTemporarily();
-}
-
-function cyclePlaybackSpeed() {
-  const video = byId("videoPlayer");
-  const cur = video.playbackRate || 1;
-  const idx = PLAYBACK_SPEEDS.findIndex((s) => Math.abs(s - cur) < 0.01);
-  const next = PLAYBACK_SPEEDS[(idx + 1) % PLAYBACK_SPEEDS.length];
-  video.playbackRate = next;
-  updatePlayerControlsUI();
-  showToast(`Playback speed: ${next}×`);
-}
-
-export function updatePlayerControlsUI() {
-  const v = byId("videoPlayer");
-  const dur = getEffectiveDuration(v);
-  const cur =
-    state.isSeeking && state.remuxMode && state.pendingRemuxSeekSec !== null
-      ? state.pendingRemuxSeekSec
-      : getEffectiveTime(v);
-  const pct = dur > 0 ? Math.max(0, Math.min(100, (cur / dur) * 100)) : 0;
-
-  byId("ctrlPlayBtn").innerHTML = v.paused ? ICONS.play : ICONS.pause;
-  byId("ctrlTimeDisplay").textContent = `${formatTime(cur)} / ${formatTime(dur)}`;
-  byId("seekProgress").style.width = `${pct}%`;
-  byId("seekThumb").style.left = `${pct}%`;
-  byId("seekBar").setAttribute("aria-valuenow", String(Math.round(pct)));
-
-  const seekBuffered = byId("seekBuffered");
-  if (dur > 0 && v.buffered && v.buffered.length > 0) {
-    const bufEnd = (state.remuxMode ? state.remuxOffsetSec : 0) + v.buffered.end(v.buffered.length - 1);
-    seekBuffered.style.width = `${Math.max(0, Math.min(100, (bufEnd / dur) * 100))}%`;
-  } else {
-    seekBuffered.style.width = "0%";
-  }
-
-  const effectiveVol = v.muted ? 0 : v.volume;
-  byId("ctrlVolumeSlider").value = String(effectiveVol);
-  byId("ctrlMuteBtn").innerHTML =
-    effectiveVol === 0 ? ICONS.volMute : effectiveVol < 0.5 ? ICONS.volLow : ICONS.volHigh;
-  byId("ctrlSpeedBtn").textContent = `${v.playbackRate || 1}×`;
-  byId("ctrlAutoplayBtn").classList.toggle("is-on", state.autoplayNext);
-  byId("ctrlFullscreenBtn").innerHTML = isStageFullscreen() ? ICONS.fsExit : ICONS.fsEnter;
-}
-
-function seekFromClientX(clientX, { commit = true } = {}) {
-  const video = byId("videoPlayer");
-  const dur = getEffectiveDuration(video);
-  if (!Number.isFinite(dur) || dur <= 0) return;
-  const rect = byId("seekBar").getBoundingClientRect();
-  const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-  const targetSec = ratio * dur;
-  if (state.remuxMode) {
-    state.pendingRemuxSeekSec = targetSec;
-    updatePlayerControlsUI();
-    if (commit) {
-      const target = state.pendingRemuxSeekSec;
-      state.pendingRemuxSeekSec = null;
-      seekToTime(target);
-    }
-    return;
-  }
-  video.currentTime = targetSec;
-  updatePlayerControlsUI();
-  updateSkipIntroVisibility();
-}
-
 /* ==================== PROGRESS SAVING & NAVIGATION ==================== */
 
 export async function saveCurrentProgress({ immediate = false, watched = null, useBeacon = false } = {}) {
@@ -618,15 +263,16 @@ export async function saveCurrentProgress({ immediate = false, watched = null, u
   if (watched !== null) payload.watched = watched;
 
   state.lastSavedAt = now;
+  const endpoint = `/api/episodes/${encodePath(ep.id)}/progress`;
 
   if (useBeacon && navigator.sendBeacon) {
     const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
-    navigator.sendBeacon(`/api/episodes/${ep.id}/progress`, blob);
+    navigator.sendBeacon(endpoint, blob);
     return;
   }
 
   try {
-    const res = await api(`/api/episodes/${ep.id}/progress`, {
+    const res = await api(endpoint, {
       method: "PATCH",
       body: JSON.stringify(payload),
     });
@@ -635,7 +281,11 @@ export async function saveCurrentProgress({ immediate = false, watched = null, u
     byId("saveStatusPill").textContent = `Saved ${formatTime(updated.position_sec)}`;
 
     // Live-update active episode progress bar in sidebar without full re-render
-    const bar = byId("episodeList").querySelector(`[data-ep-progress="${updated.id}"]`);
+    const escapedId =
+      typeof CSS !== "undefined" && typeof CSS.escape === "function"
+        ? CSS.escape(String(updated.id))
+        : String(updated.id);
+    const bar = byId("episodeList").querySelector(`[data-ep-progress="${escapedId}"]`);
     if (bar) {
       bar.style.width = `${updated.progress_percent}%`;
       bar.classList.toggle("complete", Boolean(updated.watched));
@@ -651,13 +301,15 @@ async function stepEpisode(direction) {
   await saveCurrentProgress({ immediate: true });
   const isNext = direction === "next";
   try {
-    const res = await api(`/api/shows/${state.activeShow.id}/${direction}`, {
+    const res = await api(`/api/shows/${encodePath(state.activeShow.id)}/${direction}`, {
       method: "POST",
       body: "{}",
     });
     setLinkedList(res.linked_list);
     if (!res.episode) {
-      showToast(isNext ? "You've reached the last episode of this show." : "Already at the first episode.");
+      showToast(
+        isNext ? "You've reached the last episode of this show." : "Already at the first episode."
+      );
       return;
     }
     loadEpisode(res.episode, { autoPlay: true });
@@ -672,18 +324,17 @@ export const goPrevEpisode = () => stepEpisode("prev");
 export async function backToLibrary() {
   if (state.view === "library") return;
   cancelAutoplayCountdown();
+  clearControlsTimers();
   state.introScanToken += 1;
   state.introScanning = false;
-  if (document.fullscreenElement || document.webkitFullscreenElement) {
-    (document.exitFullscreen || document.webkitExitFullscreen)?.call(document)?.catch?.(() => {});
-  }
+  exitFullscreenSafe();
   await saveCurrentProgress({ immediate: true });
   byId("videoPlayer").pause();
   setView("library");
   await callbacks.onBackToLibrary();
 }
 
-/* ==================== EVENT BINDINGS ==================== */
+/* ==================== VIDEO EVENT BINDINGS ==================== */
 
 function bindVideoEvents() {
   const video = byId("videoPlayer");
@@ -717,7 +368,7 @@ function bindVideoEvents() {
 
   video.addEventListener("timeupdate", () => {
     saveCurrentProgress({ immediate: false });
-    updatePlayerControlsUI();
+    updateTimeAndSeekUI();
 
     const dur = getEffectiveDuration(video);
     const cur = getEffectiveTime(video);
@@ -737,16 +388,16 @@ function bindVideoEvents() {
     updateSkipIntroVisibility();
   });
 
-  video.addEventListener("progress", updatePlayerControlsUI);
+  video.addEventListener("progress", updateTimeAndSeekUI);
 
   video.addEventListener("play", () => {
-    updatePlayerControlsUI();
+    updateTransportStateUI();
     showControlsTemporarily();
   });
 
   video.addEventListener("pause", () => {
     saveCurrentProgress({ immediate: true });
-    updatePlayerControlsUI();
+    updateTransportStateUI();
     stage.classList.remove("controls-hidden");
     if (state.controlsHideTimer) {
       clearTimeout(state.controlsHideTimer);
@@ -754,11 +405,11 @@ function bindVideoEvents() {
     }
   });
 
-  video.addEventListener("volumechange", updatePlayerControlsUI);
+  video.addEventListener("volumechange", updateTransportStateUI);
 
   video.addEventListener("seeked", () => {
     saveCurrentProgress({ immediate: true });
-    updatePlayerControlsUI();
+    updateTimeAndSeekUI();
     updateSkipIntroVisibility();
   });
 
@@ -798,273 +449,19 @@ function bindVideoEvents() {
   });
 }
 
-function bindCinemaControls() {
-  const video = byId("videoPlayer");
-  const stage = byId("playerStage");
-  const seekBar = byId("seekBar");
-  const seekHoverTip = byId("seekHoverTip");
-
-  byId("nextEpBtn").addEventListener("click", goNextEpisode);
-  byId("quickNextBtn").addEventListener("click", (ev) => {
-    ev.stopPropagation();
-    goNextEpisode();
-  });
-  const ctrlNextEpBtn = byId("ctrlNextEpBtn");
-  ctrlNextEpBtn.addEventListener("click", () => {
-    ctrlNextEpBtn.blur();
-    goNextEpisode();
-  });
-  byId("upNextPlayBtn").addEventListener("click", goNextEpisode);
-  byId("prevEpBtn").addEventListener("click", goPrevEpisode);
-
-  byId("upNextDismissBtn").addEventListener("click", () => {
-    cancelAutoplayCountdown();
-    if (state.currentEpisode) state.upNextDismissedFor = state.currentEpisode.id;
-    byId("upNextCard").classList.add("hidden");
-    updateSkipIntroVisibility();
-  });
-
-  byId("restartEpBtn").addEventListener("click", () => {
-    seekToTime(0, { autoPlay: true });
-    saveCurrentProgress({ immediate: true });
-  });
-
-  byId("btnFixAudioRemux")?.addEventListener("click", async () => {
-    const ep = state.currentEpisode;
-    if (!ep) return;
-    const pos = getEffectiveTime(video) || ep.position_sec || 0;
-    const audioIdx = state.audioTracks[0]?.index ?? state.activeAudioIndex ?? 0;
-    const ok = await startRemuxStream(ep, pos, audioIdx, { autoPlay: true });
-    if (ok) {
-      showToast("Reloading episode via ffmpeg remux…");
-    }
-  });
-
-  video.addEventListener("click", () => {
-    if (state.clickToggleTimer) {
-      clearTimeout(state.clickToggleTimer);
-      state.clickToggleTimer = null;
-      return;
-    }
-    state.clickToggleTimer = setTimeout(() => {
-      state.clickToggleTimer = null;
-      togglePlayPause();
-    }, 180);
-  });
-
-  video.addEventListener("dblclick", () => {
-    if (state.clickToggleTimer) {
-      clearTimeout(state.clickToggleTimer);
-      state.clickToggleTimer = null;
-    }
-    toggleFullscreen();
-  });
-
-  stage.addEventListener("mousemove", showControlsTemporarily);
-  stage.addEventListener("mouseenter", showControlsTemporarily);
-  byId("playerControls").addEventListener("click", (ev) => ev.stopPropagation());
-
-  const bindCtrlBtn = (id, fn) => {
-    const btn = byId(id);
-    if (!btn) return;
-    btn.addEventListener("click", () => {
-      btn.blur();
-      fn();
-    });
-  };
-
-  bindCtrlBtn("ctrlPlayBtn", togglePlayPause);
-  bindCtrlBtn("ctrlBackBtn", () => {
-    seekToTime(Math.max(0, getEffectiveTime(video) - 10));
-    showControlsTemporarily();
-  });
-  bindCtrlBtn("ctrlFwdBtn", () => {
-    const dur = getEffectiveDuration(video);
-    seekToTime(Math.min(dur || Infinity, getEffectiveTime(video) + 10));
-    showControlsTemporarily();
-  });
-  bindCtrlBtn("ctrlMuteBtn", toggleMute);
-  bindCtrlBtn("ctrlSubBtn", () => {
-    cycleSubtitles({ fromKeyboard: false });
-    showControlsTemporarily();
-  });
-  bindCtrlBtn("ctrlAudioBtn", () => {
-    cycleAudioTrack();
-    showControlsTemporarily();
-  });
-  bindCtrlBtn("ctrlSpeedBtn", cyclePlaybackSpeed);
-  bindCtrlBtn("ctrlAutoplayBtn", () => {
-    state.autoplayNext = !state.autoplayNext;
-    try {
-      localStorage.setItem("notflix_autoplay", state.autoplayNext ? "1" : "0");
-    } catch {
-      // ignore
-    }
-    updatePlayerControlsUI();
-    showToast(`Autoplay next episode: ${state.autoplayNext ? "On" : "Off"}`);
-  });
-  bindCtrlBtn("ctrlFullscreenBtn", toggleFullscreen);
-
-  const volSlider = byId("ctrlVolumeSlider");
-  volSlider.addEventListener("input", () => {
-    const vol = Number(volSlider.value);
-    video.volume = vol;
-    video.muted = vol === 0;
-    try {
-      localStorage.setItem("notflix_volume", String(vol));
-    } catch {
-      // ignore
-    }
-    updatePlayerControlsUI();
-  });
-
-  const onFsChange = () => {
-    updatePlayerControlsUI();
-    showControlsTemporarily();
-  };
-  document.addEventListener("fullscreenchange", onFsChange);
-  document.addEventListener("webkitfullscreenchange", onFsChange);
-
-  // Interactive seek bar with clamped hover tooltip
-  seekBar.addEventListener("pointerdown", (ev) => {
-    state.isSeeking = true;
-    seekBar.classList.add("dragging");
-    seekBar.setPointerCapture?.(ev.pointerId);
-    seekFromClientX(ev.clientX, { commit: !state.remuxMode });
-  });
-
-  seekBar.addEventListener("pointermove", (ev) => {
-    const dur = getEffectiveDuration(video);
-    const rect = seekBar.getBoundingClientRect();
-    const ratio = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
-    if (Number.isFinite(dur) && dur > 0) {
-      const hoverSec = ratio * dur;
-      const clampedPx = Math.max(30, Math.min(rect.width - 30, ratio * rect.width));
-      seekHoverTip.style.left = `${clampedPx}px`;
-      const ep = state.currentEpisode;
-      const inHoverIntro =
-        hasValidIntro(ep) && hoverSec >= ep.intro_start_sec && hoverSec <= ep.intro_end_sec;
-      const inHoverOutro = hasValidOutro(ep, dur) && hoverSec >= ep.outro_start_sec;
-      seekHoverTip.textContent = inHoverIntro
-        ? `${formatTime(hoverSec)} · Intro`
-        : inHoverOutro
-        ? `${formatTime(hoverSec)} · Credits`
-        : formatTime(hoverSec);
-      seekHoverTip.classList.remove("hidden");
-    }
-    if (state.isSeeking) {
-      seekFromClientX(ev.clientX, { commit: false });
-    }
-  });
-
-  seekBar.addEventListener("pointerup", (ev) => {
-    if (!state.isSeeking) return;
-    state.isSeeking = false;
-    seekBar.classList.remove("dragging");
-    seekBar.releasePointerCapture?.(ev.pointerId);
-    if (state.remuxMode && state.pendingRemuxSeekSec !== null) {
-      const target = state.pendingRemuxSeekSec;
-      state.pendingRemuxSeekSec = null;
-      seekToTime(target);
-    }
-    saveCurrentProgress({ immediate: true });
-    showControlsTemporarily();
-  });
-
-  seekBar.addEventListener("pointerleave", () => {
-    if (!state.isSeeking) {
-      seekHoverTip.classList.add("hidden");
-    }
-  });
-
-  // Utility strip disclosure panels
-  const toggleDetailsBtn = byId("toggleDetailsBtn");
-  toggleDetailsBtn.addEventListener("click", () => {
-    const open = byId("detailsPanel").classList.toggle("hidden") === false;
-    toggleDetailsBtn.setAttribute("aria-expanded", String(open));
-  });
-
-  const toggleShortcutsBtn = byId("toggleShortcutsBtn");
-  toggleShortcutsBtn.addEventListener("click", () => {
-    const open = byId("shortcutsPanel").classList.toggle("hidden") === false;
-    toggleShortcutsBtn.setAttribute("aria-expanded", String(open));
-  });
-}
-
-function bindKeyboardShortcuts() {
-  const video = byId("videoPlayer");
-  const stage = byId("playerStage");
-
-  document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") {
-      if (callbacks.closeOpenModal()) return;
-      const introEditorBar = byId("introEditorBar");
-      if (!introEditorBar.classList.contains("hidden")) {
-        introEditorBar.classList.add("hidden");
-        return;
-      }
-    }
-
-    if (state.view !== "watch" || callbacks.isAnyModalOpen()) return;
-    const tag = (ev.target && ev.target.tagName) || "";
-    if (["INPUT", "TEXTAREA", "SELECT"].includes(tag)) return;
-    if (tag === "BUTTON" && ev.code !== "Space") return;
-
-    if (ev.code === "Space" || ev.key === "k" || ev.key === "K") {
-      if (tag === "BUTTON" && !stage.contains(ev.target)) return;
-      ev.preventDefault();
-      togglePlayPause();
-    } else if (ev.key === "ArrowRight") {
-      ev.preventDefault();
-      const dur = getEffectiveDuration(video);
-      seekToTime(Math.min(dur || Infinity, getEffectiveTime(video) + 10));
-      showControlsTemporarily();
-    } else if (ev.key === "ArrowLeft") {
-      ev.preventDefault();
-      seekToTime(Math.max(0, getEffectiveTime(video) - 10));
-      showControlsTemporarily();
-    } else if (ev.key === "ArrowUp") {
-      ev.preventDefault();
-      video.muted = false;
-      video.volume = Math.min(1, Math.round((video.volume + 0.1) * 100) / 100);
-      showControlsTemporarily();
-    } else if (ev.key === "ArrowDown") {
-      ev.preventDefault();
-      video.volume = Math.max(0, Math.round((video.volume - 0.1) * 100) / 100);
-      showControlsTemporarily();
-    } else if (ev.key === "s" || ev.key === "S") {
-      if (!byId("skipIntroOverlay").classList.contains("hidden")) {
-        ev.preventDefault();
-        skipIntro();
-      }
-    } else if (ev.key === "c" || ev.key === "C") {
-      ev.preventDefault();
-      cycleSubtitles({ fromKeyboard: true });
-      showControlsTemporarily();
-    } else if (ev.key === "m" || ev.key === "M") {
-      ev.preventDefault();
-      toggleMute();
-    } else if (ev.key === "n" || ev.key === "N") {
-      ev.preventDefault();
-      goNextEpisode();
-    } else if (ev.key === "p" || ev.key === "P") {
-      ev.preventDefault();
-      goPrevEpisode();
-    } else if (ev.key === "r" || ev.key === "R") {
-      ev.preventDefault();
-      seekToTime(0);
-      saveCurrentProgress({ immediate: true });
-    } else if (ev.key === "f" || ev.key === "F") {
-      ev.preventDefault();
-      toggleFullscreen();
-    }
-  });
-}
-
 export function initPlayer(hooks = {}) {
   callbacks = { ...callbacks, ...hooks };
+  initPlayerTracks({
+    onControlsUpdate: updatePlayerControlsUI,
+  });
+  initPlayerControls({
+    seekToTime,
+    saveCurrentProgress,
+    goNextEpisode,
+    goPrevEpisode,
+    cancelAutoplayCountdown,
+    isAnyModalOpen: () => callbacks.isAnyModalOpen(),
+    closeOpenModal: () => callbacks.closeOpenModal(),
+  });
   bindVideoEvents();
-  bindCinemaControls();
-  bindKeyboardShortcuts();
-  installEpisodeThumbnailObserver();
 }

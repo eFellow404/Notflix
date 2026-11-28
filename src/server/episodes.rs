@@ -1,13 +1,13 @@
 //! Episode playback progress, manual intro override, and byte-range streaming endpoints.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::json;
 
 use crate::error::{NotflixError, Result};
 use crate::linked_list::EpisodeNode;
@@ -18,17 +18,10 @@ use crate::media::{
 use crate::storage::NotflixStore;
 use crate::subtitles::{discover_subtitles, load_subtitle_as_vtt};
 
-use super::{json_no_store, parse_json_object, run_blocking, AppState};
-
-fn optional_f64_field(map: &Map<String, Value>, key: &str, err_msg: &str) -> Result<Option<f64>> {
-    match map.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_f64()
-            .map(Some)
-            .ok_or_else(|| NotflixError::BadRequest(err_msg.to_string())),
-    }
-}
+use super::{
+    binary_response, json_no_store, optional_bool_or, optional_f64_field, optional_tristate_bool,
+    parse_json_object, read_file_or_not_found, require_episode, run_blocking, AppState,
+};
 
 fn episode_or_404(store: &NotflixStore, node: Option<EpisodeNode>) -> Result<Response> {
     let Some(node) = node else {
@@ -47,10 +40,7 @@ pub(super) async fn handle_progress_update(
     let map = parse_json_object(&body)?;
 
     let position_sec = optional_f64_field(&map, "position_sec", NUM_ERR)?;
-    let watched = match map.get("watched") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(v.as_bool().unwrap_or(false)),
-    };
+    let watched = optional_tristate_bool(&map, "watched");
 
     if position_sec.is_none() && watched.is_none() {
         return Err(NotflixError::BadRequest(
@@ -59,14 +49,8 @@ pub(super) async fn handle_progress_update(
     }
 
     let duration_sec = optional_f64_field(&map, "duration_sec", NUM_ERR)?;
-    let set_current = match map.get("set_current") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(v.as_bool().unwrap_or(false)),
-    };
-    let reset_position = map
-        .get("reset_position")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let set_current = optional_tristate_bool(&map, "set_current");
+    let reset_position = optional_bool_or(&map, "reset_position", false);
 
     let updated = state.store.update_progress(
         &episode_id,
@@ -86,7 +70,7 @@ pub(super) async fn handle_intro_update(
 ) -> Result<Response> {
     const INTRO_ERR: &str = "intro_start_sec and intro_end_sec must be numbers";
     let map = parse_json_object(&body)?;
-    let clear = map.get("clear").and_then(Value::as_bool).unwrap_or(false);
+    let clear = optional_bool_or(&map, "clear", false);
 
     let updated = if clear {
         state
@@ -124,10 +108,8 @@ pub(super) async fn handle_episode_tracks(
     AxumPath(episode_id): AxumPath<String>,
 ) -> Result<Response> {
     let store = state.store.clone();
-    let payload = run_blocking(move || {
-        let Some(ep) = store.get_episode(&episode_id)? else {
-            return Err(NotflixError::NotFound("Episode not found".to_string()));
-        };
+    let payload = run_blocking(move || -> Result<_> {
+        let ep = require_episode(&store, &episode_id)?;
         let ep_path = Path::new(&ep.file_path);
         let subtitles = discover_subtitles(ep_path);
         let audio = probe_audio_tracks(ep_path);
@@ -149,9 +131,7 @@ pub(super) async fn handle_episode_subtitle(
 ) -> Result<Response> {
     let store = state.store.clone();
     let vtt = run_blocking(move || {
-        let Some(ep) = store.get_episode(&episode_id)? else {
-            return Err(NotflixError::NotFound("Episode not found".to_string()));
-        };
+        let ep = require_episode(&store, &episode_id)?;
         let tracks = discover_subtitles(Path::new(&ep.file_path));
         let Some(track) = tracks.get(sub_index) else {
             return Err(NotflixError::NotFound(
@@ -162,14 +142,12 @@ pub(super) async fn handle_episode_subtitle(
     })
     .await??;
 
-    let mut resp = (StatusCode::OK, vtt).into_response();
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/vtt; charset=utf-8"),
-    );
-    resp.headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Ok(resp)
+    Ok(binary_response(
+        StatusCode::OK,
+        "text/vtt; charset=utf-8",
+        "no-store",
+        vtt.into_bytes(),
+    ))
 }
 
 pub(super) async fn handle_episode_thumbnail(
@@ -178,35 +156,25 @@ pub(super) async fn handle_episode_thumbnail(
 ) -> Result<Response> {
     let store = state.store.clone();
     let (bytes, mime) = run_blocking(move || {
-        let Some(ep) = store.get_episode(&episode_id)? else {
-            return Err(NotflixError::NotFound("Episode not found".to_string()));
-        };
+        let ep = require_episode(&store, &episode_id)?;
         let cache_dir = store.db_dir().join("thumbs");
         let Some(thumb_path) =
             find_or_generate_episode_thumbnail(Path::new(&ep.file_path), &cache_dir, &episode_id)
         else {
             return Err(NotflixError::NotFound("Thumbnail not found".to_string()));
         };
-        let data = std::fs::read(&thumb_path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                NotflixError::NotFound("Thumbnail not found".to_string())
-            } else {
-                NotflixError::Io(e)
-            }
-        })?;
+        let data = read_file_or_not_found(&thumb_path, "Thumbnail not found")?;
         let mime = guess_image_mime(&thumb_path);
         Ok((data, mime))
     })
     .await??;
 
-    let mut resp = (StatusCode::OK, bytes).into_response();
-    resp.headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
-    resp.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=86400"),
-    );
-    Ok(resp)
+    Ok(binary_response(
+        StatusCode::OK,
+        mime,
+        "public, max-age=86400",
+        bytes,
+    ))
 }
 
 pub(super) async fn handle_stream_get(
@@ -216,23 +184,15 @@ pub(super) async fn handle_stream_get(
     headers: HeaderMap,
 ) -> Response {
     if query.remux == Some(1) {
-        let ep = match state.store.get_episode(&episode_id) {
-            Ok(Some(ep)) => ep,
-            Ok(None) => {
-                return NotflixError::NotFound("Episode not found".to_string()).into_response();
-            }
+        let ep = match require_episode(&state.store, &episode_id) {
+            Ok(ep) => ep,
             Err(e) => return e.into_response(),
         };
-        let file_path = PathBuf::from(&ep.file_path);
-        if !file_path.is_file() {
-            return NotflixError::NotFound("Video file not found on disk".to_string())
-                .into_response();
-        }
         let start_sec = query
             .start
             .filter(|v| v.is_finite() && *v >= 0.0)
             .unwrap_or(0.0);
-        return stream_remuxed_video(&file_path, start_sec, query.audio).await;
+        return stream_remuxed_video(Path::new(&ep.file_path), start_sec, query.audio).await;
     }
     handle_stream_impl(&state, &episode_id, &headers, false).await
 }
@@ -251,13 +211,10 @@ async fn handle_stream_impl(
     headers: &HeaderMap,
     head_only: bool,
 ) -> Response {
-    let ep = match state.store.get_episode(episode_id) {
-        Ok(Some(ep)) => ep,
-        Ok(None) => {
-            if head_only {
-                return StatusCode::NOT_FOUND.into_response();
-            }
-            return NotflixError::NotFound("Episode not found".to_string()).into_response();
+    let ep = match require_episode(&state.store, episode_id) {
+        Ok(ep) => ep,
+        Err(NotflixError::NotFound(_)) if head_only => {
+            return StatusCode::NOT_FOUND.into_response();
         }
         Err(e) => return e.into_response(),
     };

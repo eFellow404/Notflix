@@ -450,7 +450,7 @@ fn outro_migration_save_preserve_manual_and_rescan() {
     }
 
     let store = NotflixStore::new(Some(db_path)).expect("open migrated store");
-    assert_eq!(store.db_dir(), base);
+    assert_eq!(store.db_dir(), notflix::util::resolve_path(base));
 
     // Existing row survived migration intact with default outro fields
     let (_, legacy_ll) = store
